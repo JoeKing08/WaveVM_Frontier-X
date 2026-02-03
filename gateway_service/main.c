@@ -1,0 +1,31 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include "aggregator.h"
+
+int main(int argc, char **argv) {
+    if (argc < 5) {
+        fprintf(stderr, "Usage: %s <LOCAL_PORT> <UPSTREAM_IP> <UPSTREAM_PORT> <CONFIG_FILE>\n", argv[0]);
+        return 1;
+    }
+
+    int local = atoi(argv[1]);
+    const char *up_ip = argv[2];
+    int up_port = atoi(argv[3]);
+    const char *conf = argv[4];
+
+    printf("[*] GiantVM Gateway V16 (Chain Mode)\n");
+    
+    if (init_aggregator(local, up_ip, up_port, conf) != 0) {
+        fprintf(stderr, "[-] Init failed.\n");
+        return 1;
+    }
+
+    while(1) {
+        flush_all_buffers();
+        usleep(1000); //太长会卡，太短烧 CPU
+    }
+    return 0;
+}
+
