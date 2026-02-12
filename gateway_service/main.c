@@ -1,12 +1,12 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include "aggregator.h"
+#include "../common_include/wavevm_protocol.h" 
 
 int main(int argc, char **argv) {
-    if (argc < 5) {
-        fprintf(stderr, "Usage: %s <LOCAL_PORT> <UPSTREAM_IP> <UPSTREAM_PORT> <CONFIG_FILE>\n", argv[0]);
+    if (argc < 6) {
+        fprintf(stderr, "Usage: %s <LOCAL_PORT> <UPSTREAM_IP> <UPSTREAM_PORT> <CONFIG_FILE> <CTRL_PORT>\n", argv[0]);
         return 1;
     }
 
@@ -15,7 +15,9 @@ int main(int argc, char **argv) {
     int up_port = atoi(argv[3]);
     const char *conf = argv[4];
 
-    printf("[*] GiantVM Gateway V16 (Chain Mode)\n");
+    g_ctrl_port = atoi(argv[5]);
+
+    printf("[*] WaveVM Gateway V16 (Chain Mode) | CtrlPort: %d\n", g_ctrl_port);
     
     if (init_aggregator(local, up_ip, up_port, conf) != 0) {
         fprintf(stderr, "[-] Init failed.\n");
@@ -28,4 +30,3 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
-

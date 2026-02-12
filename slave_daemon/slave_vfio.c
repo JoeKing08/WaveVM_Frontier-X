@@ -1,4 +1,3 @@
-
 /*
  * [IDENTITY] VFIO Interceptor - The GPU Virtualizer
  * ---------------------------------------------------------------------------
@@ -28,13 +27,13 @@
 #include <arpa/inet.h>      // 用于发送中断包
 
 #include "slave_vfio.h"
-#include "../common_include/giantvm_protocol.h"
+#include "../common_include/wavevm_protocol.h"
 
 #define VFIO_CONTAINER_PATH "/dev/vfio/vfio"
 #define MAX_EPOLL_EVENTS 16
 
 static int g_container_fd = -1;
-static gvm_vfio_device_t g_devices[MAX_VFIO_DEVICES];
+static wvm_vfio_device_t g_devices[MAX_VFIO_DEVICES];
 static int g_dev_count = 0;
 
 // 网络上下文，用于发送中断
@@ -87,7 +86,7 @@ static int enable_bus_master(int device_fd) {
  * [关键逻辑] 创建 eventfd 并将其注入物理硬件的 MSI-X 中断向量表中，实现硬件中断到用户态事件的转化。
  * [后果] 它是中断转发的源头。如果没有 eventfd 的正确绑定，Slave 端的显卡在完成任务后将无法通知 Master 端的 vCPU。
  */
-static int setup_irq(gvm_vfio_device_t *dev) {
+static int setup_irq(wvm_vfio_device_t *dev) {
     // 为简单起见，且为了保证通用性，我们优先尝试启用 INTx (Legacy Interrupt)
     // 真实的 GPU 驱动通常会请求 MSI-X，这需要拦截配置空间的写操作来动态建立映射。
     // 由于 V27.0 不拦截 Config Space 写（太复杂），我们假设 Host VFIO 驱动
@@ -135,7 +134,7 @@ static int setup_irq(gvm_vfio_device_t *dev) {
 // -----------------------------------------------------------
 // 辅助: 获取 Region 真实偏移
 // -----------------------------------------------------------
-static int setup_region(gvm_vfio_device_t *dev, int index, uint64_t gpa_base, uint64_t config_size) {
+static int setup_region(wvm_vfio_device_t *dev, int index, uint64_t gpa_base, uint64_t config_size) {
     struct vfio_region_info reg = { .argsz = sizeof(reg) };
     reg.index = index;
     
@@ -162,7 +161,7 @@ static int setup_region(gvm_vfio_device_t *dev, int index, uint64_t gpa_base, ui
  */
 static int init_device(const char *pci_id, const char *group_path, uint64_t *bar_gpas, uint64_t *bar_sizes) {
     if (g_dev_count >= MAX_VFIO_DEVICES) return -1;
-    gvm_vfio_device_t *dev = &g_devices[g_dev_count];
+    wvm_vfio_device_t *dev = &g_devices[g_dev_count];
     
     // 1. Container Init
     if (g_container_fd < 0) {
@@ -223,7 +222,7 @@ static int init_device(const char *pci_id, const char *group_path, uint64_t *bar
 // -----------------------------------------------------------
 // 外部接口 1: 初始化
 // -----------------------------------------------------------
-int gvm_vfio_init(const char *config_file) {
+int wvm_vfio_init(const char *config_file) {
     if (!config_file) return -1;
     FILE *fp = fopen(config_file, "r");
     if (!fp) {
@@ -273,12 +272,12 @@ int gvm_vfio_init(const char *config_file) {
 // -----------------------------------------------------------
 // 外部接口 2: MMIO 拦截
 // -----------------------------------------------------------
-int gvm_vfio_intercept_mmio(uint64_t gpa, void *data, int len, int is_write) {
+int wvm_vfio_intercept_mmio(uint64_t gpa, void *data, int len, int is_write) {
     for (int i = 0; i < g_dev_count; i++) {
         if (!g_devices[i].active) continue;
         
         for (int j = 0; j < MAX_BARS; j++) {
-            gvm_vfio_region_t *reg = &g_devices[i].regions[j];
+            wvm_vfio_region_t *reg = &g_devices[i].regions[j];
             if (!reg->active) continue;
 
             if (gpa >= reg->gpa_start && gpa < reg->gpa_start + reg->size) {
@@ -313,7 +312,7 @@ static long diff_us(struct timespec *now, struct timespec *prev) {
  * [关键逻辑] 使用 epoll 监听 eventfd，并强制执行 100us 的物理去抖动，防止高频中断冲垮 Master 链路。
  * [后果] 保护了全网信道的稳定性。它通过在物理源头限制中断频率，保证了分布式系统不会陷入“中断风暴”死循环。
  */
-void gvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr) {
+void wvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr) {
     if (g_dev_count == 0) return;
 
     // 1. 设置网络上下文 (复制一份，因为主线程可能修改)
@@ -342,7 +341,7 @@ void gvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr) {
         }
         registered_count++;
     }
-    
+
     if (registered_count == 0) {
         printf("[VFIO] No interrupts to poll. Thread exiting.\n");
         close(epfd);
@@ -367,10 +366,10 @@ void gvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr) {
             if (read(irq_fd, &counter, sizeof(counter)) == sizeof(counter)) {
                 
                 // 构造中断包发送给 Master
-                struct gvm_header hdr;
+                struct wvm_header hdr;
                 memset(&hdr, 0, sizeof(hdr)); 
 
-                hdr.magic = htonl(GVM_MAGIC);
+                hdr.magic = htonl(WVM_MAGIC);
                 hdr.msg_type = htons(MSG_VFIO_IRQ);
                 hdr.payload_len = 0;
                 hdr.slave_id = 0; 
@@ -393,4 +392,3 @@ void gvm_vfio_poll_irqs(int master_sock, struct sockaddr_in *master_addr) {
     }
     close(epfd);
 }
-

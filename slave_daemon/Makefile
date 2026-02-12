@@ -1,7 +1,6 @@
-
 CC = gcc
 CFLAGS = -Wall -O3 -I../common_include -pthread 
-TARGET = giantvm_slave
+TARGET = wavevm_node_slave
 SRCS = slave_hybrid.c slave_vfio.c
 
 all: $(TARGET)
@@ -11,8 +10,3 @@ $(TARGET): $(SRCS)
 
 clean:
 	rm -f $(TARGET)
-
----
-
-## Step 7: 控制面工具 (Control Tool)
-

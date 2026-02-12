@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,11 +5,11 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
-#include "../common_include/giantvm_ioctl.h"
-#include "../common_include/giantvm_config.h"
+#include "../common_include/wavevm_ioctl.h"
+#include "../common_include/wavevm_config.h"
 
 /*
- * GiantVM V29 Control Tool (Heterogeneous-Aware)
+ * WaveVM V29 Control Tool (Heterogeneous-Aware)
  * 
  * 职责：
  * 1. 解析 V27 风格的异构配置 (Cores/RAM)。
@@ -19,9 +18,9 @@
  */
 
 // 虚拟节点粒度：每 4GB RAM 对应 1 个 DHT 槽位 (Virtual Node)
-#define GVM_RAM_UNIT_GB 4 
+#define WVM_RAM_UNIT_GB 4 
 
-static uint32_t local_cpu_table[GVM_CPU_ROUTE_TABLE_SIZE];
+static uint32_t local_cpu_table[WVM_CPU_ROUTE_TABLE_SIZE];
 
 typedef struct {
     int phys_id;    // 配置文件里的 BaseID (物理ID)
@@ -39,16 +38,16 @@ typedef struct {
 void inject_cpu_route(int dev_fd) {
     uint32_t chunk_size = 1024;
     // 动态分配，避免栈溢出
-    size_t buf_size = sizeof(struct gvm_ioctl_route_update) + chunk_size * sizeof(uint32_t);
-    struct gvm_ioctl_route_update *payload = malloc(buf_size);
+    size_t buf_size = sizeof(struct wvm_ioctl_route_update) + chunk_size * sizeof(uint32_t);
+    struct wvm_ioctl_route_update *payload = malloc(buf_size);
     if (!payload) { perror("malloc"); exit(1); }
 
-    printf("[*] Injecting CPU Topology (%d vCPUs)...\n", GVM_CPU_ROUTE_TABLE_SIZE);
+    printf("[*] Injecting CPU Topology (%d vCPUs)...\n", WVM_CPU_ROUTE_TABLE_SIZE);
 
-    for (uint32_t i = 0; i < GVM_CPU_ROUTE_TABLE_SIZE; i += chunk_size) {
+    for (uint32_t i = 0; i < WVM_CPU_ROUTE_TABLE_SIZE; i += chunk_size) {
         uint32_t current_count = chunk_size;
-        if (i + current_count > GVM_CPU_ROUTE_TABLE_SIZE) 
-            current_count = GVM_CPU_ROUTE_TABLE_SIZE - i;
+        if (i + current_count > WVM_CPU_ROUTE_TABLE_SIZE) 
+            current_count = WVM_CPU_ROUTE_TABLE_SIZE - i;
 
         payload->start_index = i;
         payload->count = current_count;
@@ -69,8 +68,8 @@ void inject_cpu_route(int dev_fd) {
 
 // 辅助：注入全局参数
 void inject_global_param(int dev_fd, int slot, int value) {
-    size_t buf_size = sizeof(struct gvm_ioctl_route_update) + sizeof(uint32_t);
-    struct gvm_ioctl_route_update *payload = malloc(buf_size);
+    size_t buf_size = sizeof(struct wvm_ioctl_route_update) + sizeof(uint32_t);
+    struct wvm_ioctl_route_update *payload = malloc(buf_size);
     
     payload->start_index = slot; 
     payload->count = 1;
@@ -84,7 +83,7 @@ void inject_global_param(int dev_fd, int slot, int value) {
 
 // 辅助：注入单个网关条目
 void inject_gateway(int dev_fd, int id, const char* ip, int port) {
-    struct gvm_ioctl_gateway gw_cmd;
+    struct wvm_ioctl_gateway gw_cmd;
     gw_cmd.gw_id = id;
     gw_cmd.ip = inet_addr(ip);
     gw_cmd.port = htons(port);
@@ -102,19 +101,19 @@ int main(int argc, char **argv) {
     const char *config_file = argv[1];
     int my_phys_id = atoi(argv[2]); // 这里的 ID 对应配置文件里的 BaseID
 
-    int dev_fd = open("/dev/giantvm", O_RDWR);
+    int dev_fd = open("/dev/wavevm", O_RDWR);
     if (dev_fd < 0) {
-        perror("[-] Failed to open /dev/giantvm");
+        perror("[-] Failed to open /dev/wavevm");
         return 1;
     }
 
     FILE *fp = fopen(config_file, "r");
     if (!fp) { perror("[-] Config open failed"); return 1; }
 
-    printf("[*] GiantVM V29.5 Control Tool (Heterogeneous Engine)\n");
+    printf("[*] WaveVM V29.5 Control Tool (Heterogeneous Engine)\n");
 
     // 1. 解析配置并计算权重
-    NodeInfo *nodes = malloc(sizeof(NodeInfo) * GVM_MAX_SLAVES);
+    NodeInfo *nodes = malloc(sizeof(NodeInfo) * WVM_MAX_SLAVES);
     if (!nodes) { perror("malloc nodes"); return 1; }
     int node_count = 0;
     char line[256];
@@ -134,8 +133,8 @@ int main(int argc, char **argv) {
         if (sscanf(line, "%*s %d %63s %d %d %d", &bid, ip, &port, &cores, &ram) == 5) {
             
             // [FIX 1] 边界检查：防止数组越界
-            if (node_count >= GVM_MAX_SLAVES) {
-                fprintf(stderr, "[Warn] Max node limit (%lu) reached. Ignoring remaining config.\n", GVM_MAX_SLAVES);
+            if (node_count >= WVM_MAX_SLAVES) {
+                fprintf(stderr, "[Warn] Max node limit (%lu) reached. Ignoring remaining config.\n", WVM_MAX_SLAVES);
                 break; // 停止解析，保护内存
             }
 
@@ -145,7 +144,7 @@ int main(int argc, char **argv) {
             nodes[node_count].cores = cores;
             nodes[node_count].ram_gb = ram;
             
-            int v_count = ram / GVM_RAM_UNIT_GB;
+            int v_count = ram / WVM_RAM_UNIT_GB;
             if (v_count < 1) v_count = 1;
             
             nodes[node_count].vnode_start = total_vnodes;
@@ -178,7 +177,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < node_count; i++) {
         // 分配该节点拥有的 Cores 数量的 vCPU
         for (int c = 0; c < nodes[i].cores; c++) {
-            if (current_vcpu < GVM_CPU_ROUTE_TABLE_SIZE) {
+            if (current_vcpu < WVM_CPU_ROUTE_TABLE_SIZE) {
                 // 指向该物理机的第一个虚拟 ID (Primary ID)
                 local_cpu_table[current_vcpu++] = nodes[i].vnode_start;
             }
@@ -186,7 +185,7 @@ int main(int argc, char **argv) {
     }
     // 填补剩余 vCPU (Round-Robin)
     int node_cursor = 0;
-    while (current_vcpu < GVM_CPU_ROUTE_TABLE_SIZE) {
+    while (current_vcpu < WVM_CPU_ROUTE_TABLE_SIZE) {
         local_cpu_table[current_vcpu++] = nodes[node_cursor].vnode_start;
         node_cursor = (node_cursor + 1) % node_count;
     }

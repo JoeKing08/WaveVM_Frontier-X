@@ -1,4 +1,3 @@
-
 /*
  * [IDENTITY] Main Wrapper - The Identity Mapper
  * ---------------------------------------------------------------------------
@@ -26,7 +25,7 @@
 #include <pthread.h>
 
 #include "logic_core.h"
-#include "../common_include/giantvm_protocol.h"
+#include "../common_include/wavevm_protocol.h"
 
 // --- 全局状态 ---
 extern struct dsm_driver_ops u_ops;
@@ -34,6 +33,10 @@ extern int user_backend_init(int my_node_id, int port);
 void *g_shm_ptr = NULL; 
 size_t g_shm_size = 0;
 int g_dev_fd = -1;
+extern int g_my_node_id;
+
+#define MAX_QEMU_CLIENTS 8
+#define NUM_BCAST_WORKERS 8
 
 // 初始种子节点
 #define MAX_SEEDS 8
@@ -45,6 +48,9 @@ static int g_client_count = 0;
 static pthread_mutex_t g_client_lock = PTHREAD_MUTEX_INITIALIZER;
 
 extern void* broadcast_worker_thread(void* arg);
+extern void* autonomous_monitor_thread(void* arg);
+int g_sync_batch_size = 64;
+void handle_ipc_rpc_passthrough(int qemu_fd, void *data, uint32_t len) { (void)qemu_fd; (void)data; (void)len; }
 
 /* 
  * [物理意图] 实现“异构资源到逻辑维度的映射”，确立节点在 P2P 环上的权重。
@@ -58,7 +64,7 @@ void load_swarm_config(const char *filename) {
     char line[256];
     
     // 虚拟节点粒度: 4GB = 1 DHT Slot (必须与 ctl_tool 保持一致)
-    #define GVM_RAM_UNIT_GB 4 
+    #define WVM_RAM_UNIT_GB 4 
 
     int total_vnodes = 0; // DHT 环上的总虚拟节点数
     int phys_node_count = 0;
@@ -69,7 +75,7 @@ void load_swarm_config(const char *filename) {
         int id;
         int cores;
         int vnode_start; // 该物理机对应的第一个虚拟 ID (Primary ID)
-    } *phys_nodes = malloc(sizeof(struct PhysNodeInfo) * GVM_MAX_SLAVES);
+    } *phys_nodes = malloc(sizeof(struct PhysNodeInfo) * WVM_MAX_SLAVES);
 
     if (!phys_nodes) { perror("malloc"); exit(1); }
 
@@ -98,7 +104,7 @@ void load_swarm_config(const char *filename) {
 
             // --- 核心逻辑不变 ---
             // 1. 计算虚拟节点数量
-            int v_count = ram / GVM_RAM_UNIT_GB;
+            int v_count = ram / WVM_RAM_UNIT_GB;
             if (v_count < 1) v_count = 1;
 
             // 2. 注入 Gateway IP 表
@@ -108,7 +114,7 @@ void load_swarm_config(const char *filename) {
             }
 
             // 3. 记录物理节点信息
-            if (phys_node_count < GVM_MAX_SLAVES) {
+            if (phys_node_count < WVM_MAX_SLAVES) {
                 // [关键] 这里强制使用配置文件里的 ID，而不是行号
                 phys_nodes[phys_node_count].id = bid; 
                 phys_nodes[phys_node_count].cores = cores;
@@ -123,7 +129,7 @@ void load_swarm_config(const char *filename) {
 
     // 4. 注入 Total Nodes 到 Logic Core (用于 DHT 取模)
     // 注意：这里传的是 total_vnodes，不是物理节点数！
-    gvm_set_mem_mapping(0, (uint32_t)total_vnodes);
+    wvm_set_mem_mapping(0, (uint32_t)total_vnodes);
     printf("[Config] DHT Ring Size: %d Virtual Nodes (from %d Physical).\n", total_vnodes, phys_node_count);
 
     // 5. 构建并注入 CPU 路由表 (Logic Core)
@@ -133,9 +139,9 @@ void load_swarm_config(const char *filename) {
     // 第一轮：按物理核心数填充 (Core-Weighted)
     for (int i = 0; i < phys_node_count; i++) {
         for (int c = 0; c < phys_nodes[i].cores; c++) {
-            if (current_vcpu < 4096) { // GVM_CPU_ROUTE_TABLE_SIZE
+            if (current_vcpu < 4096) { // WVM_CPU_ROUTE_TABLE_SIZE
                 // CPU 调度指向该物理机的 Primary Virtual ID
-                gvm_set_cpu_mapping(current_vcpu++, phys_nodes[i].vnode_start);
+                wvm_set_cpu_mapping(current_vcpu++, phys_nodes[i].vnode_start);
             }
         }
     }
@@ -143,7 +149,7 @@ void load_swarm_config(const char *filename) {
     // 第二轮：填补剩余空位 (Round-Robin)
     int node_cursor = 0;
     while (current_vcpu < 4096) {
-        gvm_set_cpu_mapping(current_vcpu++, phys_nodes[node_cursor].vnode_start);
+        wvm_set_cpu_mapping(current_vcpu++, phys_nodes[node_cursor].vnode_start);
         node_cursor = (node_cursor + 1) % phys_node_count;
     }
     
@@ -156,21 +162,21 @@ void load_swarm_config(const char *filename) {
  * [关键逻辑] 拦截 IPC 管道中的缺页与 CPU 任务，调用 Logic Core 判定权属，并决定是本地执行还是发起网络 RPC。
  * [后果] 实现了前后端解耦。它保证了前端 QEMU 不需要理解复杂的 DHT 逻辑，只需发出“我要这块内存”的原始指令。
  */
-static void handle_ipc_fault(int qemu_fd, struct gvm_ipc_fault_req* req) {
-    struct gvm_ipc_fault_ack ack; // 使用扩展后的 ACK 结构
+static void handle_ipc_fault(int qemu_fd, struct wvm_ipc_fault_req* req) {
+    struct wvm_ipc_fault_ack ack; // 使用扩展后的 ACK 结构
     void *target_page_addr = (uint8_t*)g_shm_ptr + req->gpa;
     
-    ack.status = gvm_handle_page_fault_logic(req->gpa, target_page_addr, &ack.version);
+    ack.status = wvm_handle_page_fault_logic(req->gpa, target_page_addr, &ack.version);
     
     write(qemu_fd, &ack, sizeof(ack));
 }
 
-static void handle_ipc_cpu_run(int qemu_fd, struct gvm_ipc_cpu_run_req* req) {
-    struct gvm_ipc_cpu_run_ack ack;
-    if (req->slave_id == GVM_NODE_AUTO_ROUTE) {
-        req->slave_id = gvm_get_compute_slave_id(req->vcpu_index);
+static void handle_ipc_cpu_run(int qemu_fd, struct wvm_ipc_cpu_run_req* req) {
+    struct wvm_ipc_cpu_run_ack ack;
+    if (req->slave_id == WVM_NODE_AUTO_ROUTE) {
+        req->slave_id = wvm_get_compute_slave_id(req->vcpu_index);
     }
-    ack.status = gvm_rpc_call(MSG_VCPU_RUN, &req->ctx, 
+    ack.status = wvm_rpc_call(MSG_VCPU_RUN, &req->ctx, 
         req->mode_tcg ? sizeof(req->ctx.tcg) : sizeof(req->ctx.kvm), 
         req->slave_id, &ack.ctx, sizeof(ack.ctx));
     ack.mode_tcg = req->mode_tcg;
@@ -179,20 +185,20 @@ static void handle_ipc_cpu_run(int qemu_fd, struct gvm_ipc_cpu_run_req* req) {
 
 /* 
  * [物理意图] 维护 Wavelet 协议的“最后一百米”：将网络推送推入 QEMU 的监听线程。
- * [关键逻辑] 构造伪造的 gvm_header 封装入 IPC 包，强制唤醒 QEMU 的信号处理逻辑以更新本地 TLB/EPT。
+ * [关键逻辑] 构造伪造的 wvm_header 封装入 IPC 包，强制唤醒 QEMU 的信号处理逻辑以更新本地 TLB/EPT。
  * [后果] 实现了“真理下达”。若此函数丢失，Daemon 虽然收到了数据，但 QEMU 里的 vCPU 依然会因为读到过期旧数据而崩溃。
  */
 void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len) {
-    gvm_ipc_header_t ipc_hdr;
-    ipc_hdr.type = GVM_IPC_TYPE_INVALIDATE;
-    ipc_hdr.len = sizeof(struct gvm_header) + len;
+    wvm_ipc_header_t ipc_hdr;
+    ipc_hdr.type = WVM_IPC_TYPE_INVALIDATE;
+    ipc_hdr.len = sizeof(struct wvm_header) + len;
     
     uint8_t* buffer = malloc(sizeof(ipc_hdr) + ipc_hdr.len);
     if (!buffer) return;
 
     memcpy(buffer, &ipc_hdr, sizeof(ipc_hdr));
-    // We need to construct a fake gvm_header for the push listener
-    struct gvm_header *hdr = (struct gvm_header*)(buffer + sizeof(ipc_hdr));
+    // We need to construct a fake wvm_header for the push listener
+    struct wvm_header *hdr = (struct wvm_header*)(buffer + sizeof(ipc_hdr));
     hdr->msg_type = htons(msg_type);
     memcpy((void*)hdr + sizeof(*hdr), payload, len);
     
@@ -205,8 +211,8 @@ void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len) {
 }
 
 void broadcast_irq_to_qemu(void) {
-    gvm_ipc_header_t ipc_hdr;
-    ipc_hdr.type = GVM_IPC_TYPE_IRQ;
+    wvm_ipc_header_t ipc_hdr;
+    ipc_hdr.type = WVM_IPC_TYPE_IRQ;
     ipc_hdr.len = 0;
     
     pthread_mutex_lock(&g_client_lock);
@@ -231,8 +237,8 @@ void* client_handler(void *socket_desc) {
     }
     pthread_mutex_unlock(&g_client_lock);
 
-    gvm_ipc_header_t ipc_hdr;
-    uint8_t payload_buf[sizeof(struct gvm_ipc_cpu_run_req)]; // Use largest possible payload
+    wvm_ipc_header_t ipc_hdr;
+    uint8_t payload_buf[sizeof(struct wvm_ipc_cpu_run_req)]; // Use largest possible payload
 
     while (read(qemu_fd, &ipc_hdr, sizeof(ipc_hdr)) == sizeof(ipc_hdr)) {
         if (ipc_hdr.len > sizeof(payload_buf)) {
@@ -250,23 +256,60 @@ void* client_handler(void *socket_desc) {
         if (read(qemu_fd, payload_buf, ipc_hdr.len) != ipc_hdr.len) break;
 
         switch (ipc_hdr.type) {
-            case GVM_IPC_TYPE_MEM_FAULT:
-                handle_ipc_fault(qemu_fd, (struct gvm_ipc_fault_req*)payload_buf);
+            case WVM_IPC_TYPE_MEM_FAULT:
+                handle_ipc_fault(qemu_fd, (struct wvm_ipc_fault_req*)payload_buf);
                 break;
-            case GVM_IPC_TYPE_CPU_RUN:
-                handle_ipc_cpu_run(qemu_fd, (struct gvm_ipc_cpu_run_req*)payload_buf);
+            case WVM_IPC_TYPE_CPU_RUN:
+                handle_ipc_cpu_run(qemu_fd, (struct wvm_ipc_cpu_run_req*)payload_buf);
                 break;
-            case GVM_IPC_TYPE_COMMIT_DIFF: {
+            case WVM_IPC_TYPE_COMMIT_DIFF: {
                 // This is the new IPC type for V29
-                struct gvm_diff_log* log = (struct gvm_diff_log*)payload_buf;
-                uint32_t dir_node = gvm_get_directory_node_id(log->gpa);
+                struct wvm_diff_log* log = (struct wvm_diff_log*)payload_buf;
+                uint32_t dir_node = wvm_get_directory_node_id(log->gpa);
                 // Send MSG_COMMIT_DIFF to the correct directory node
                 u_ops.send_packet_async(MSG_COMMIT_DIFF, log, ipc_hdr.len, dir_node, 1);
                 break;
             }
-            case GVM_IPC_TYPE_RPC_PASSTHROUGH: { // Type 99
+            case WVM_IPC_TYPE_RPC_PASSTHROUGH: { // Type 99
                 extern void handle_ipc_rpc_passthrough(int qemu_fd, void *data, uint32_t len);
                 handle_ipc_rpc_passthrough(qemu_fd, payload_buf, ipc_hdr.len);
+                break;
+            }
+            case WVM_IPC_TYPE_BLOCK_IO: {
+                // 解析自定义的 IPC Block 结构
+                struct wvm_ipc_block_req {
+                    uint64_t lba;
+                    uint32_t len;
+                    uint8_t  is_write;
+                    uint8_t  data[0];
+                } *req = (void*)payload_buf;
+                
+                // 1. 计算目标节点
+                uint32_t target = wvm_get_storage_node_id(req->lba);
+                
+                // 2. 构造网络包
+                size_t blk_size = sizeof(struct wvm_block_payload) + req->len;
+                size_t pkt_len = sizeof(struct wvm_header) + blk_size;
+                
+                // 申请 Packet (使用 u_ops)
+                uint8_t *pkt = u_ops.alloc_packet(pkt_len, 0);
+                if (pkt) {
+                    struct wvm_header *h = (struct wvm_header *)pkt;
+                    h->magic = htonl(WVM_MAGIC);
+                    h->msg_type = htons(req->is_write ? MSG_BLOCK_WRITE : MSG_BLOCK_READ);
+                    h->payload_len = htons(blk_size);
+                    h->slave_id = htonl(g_my_node_id);
+                    h->qos_level = 1; // 存储 IO 优先级高
+                    
+                    struct wvm_block_payload *p = (void*)(pkt + sizeof(*h));
+                    p->lba = WVM_HTONLL(req->lba);
+                    p->count = htonl(req->len / 512);
+                    if (req->is_write) memcpy(p->data, req->data, req->len);
+                    
+                    // 发送
+                    u_ops.send_packet(pkt, pkt_len, target);
+                    u_ops.free_packet(pkt);
+                }
                 break;
             }
             default:
@@ -274,7 +317,21 @@ void* client_handler(void *socket_desc) {
         }
     }
     close(qemu_fd);
-    // Remove from client list (production code would need this)
+    
+    // 移除客户端并压缩数组，防止 Slot 耗尽
+    pthread_mutex_lock(&g_client_lock);
+    for (int i = 0; i < g_client_count; i++) {
+        if (g_qemu_clients[i] == qemu_fd) {
+            // 将最后一个元素移到当前空位（无序数组删除法，效率 O(1)）
+            if (i != g_client_count - 1) {
+                g_qemu_clients[i] = g_qemu_clients[g_client_count - 1];
+            }
+            g_client_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_client_lock);
+    
     return NULL;
 }
 
@@ -301,7 +358,7 @@ void load_initial_seeds(const char *config_file) {
                 
                 // 关键：将种子节点预埋入局部视图
                 // 初始状态设为 SHADOW，等待心跳激活
-                update_local_topology_view(id, 0, NODE_STATE_SHADOW, &g_seeds[g_seed_count]);
+                update_local_topology_view(id, 0, NODE_STATE_SHADOW, &g_seeds[g_seed_count], 0);
                 g_seed_count++;
             }
         }
@@ -312,16 +369,16 @@ void load_initial_seeds(const char *config_file) {
 // --- Main Entry ---
 int main(int argc, char **argv) {
     // 参数检查
-    if (argc < 5) {
-        fprintf(stderr, "Usage: %s <RAM_MB> <LOCAL_PORT> <SWARM_CONFIG> <MY_PHYS_ID> [SYNC_BATCH]\n", argv[0]);
+    if (argc < 7) {
+        fprintf(stderr, "Usage: %s <RAM_MB> <LOCAL_PORT> <SWARM_CONFIG> <MY_PHYS_ID> <CTRL_PORT> <SLAVE_PORT> [SYNC_BATCH]\n", argv[0]);
         return 1;
     }
 
-    g_dev_fd = open("/dev/giantvm", O_RDWR);
+    g_dev_fd = open("/dev/wavevm", O_RDWR);
     if (g_dev_fd < 0) {
         // 如果是纯用户态模式，这可能不是致命的，但在 Mode A 下是致命的。
         // 打印警告即可，方便调试
-        perror("[Warning] Failed to open /dev/giantvm (Kernel Mode disabled?)");
+        perror("[Warning] Failed to open /dev/wavevm (Kernel Mode disabled?)");
     }
 
 
@@ -331,14 +388,16 @@ int main(int argc, char **argv) {
     int local_port = atoi(argv[2]);
     const char *config_file = argv[3];
     int my_phys_id = atoi(argv[4]); // 用户传入的是物理 ID (配置文件行号)
-
+    g_ctrl_port = atoi(argv[5]);
+    extern int g_slave_forward_port; 
+    g_slave_forward_port = atoi(argv[6]);
     // 可选参数：批量同步大小
-    if (argc >= 6) {
+    if (argc >= 8) {
         extern int g_sync_batch_size;
-        g_sync_batch_size = atoi(argv[5]);
+        g_sync_batch_size = atoi(argv[7]);
     }
 
-    printf("[*] GiantVM Swarm V29.5 'Wavelet' Node Daemon (PhysID: %d)\n", my_phys_id);
+    printf("[*] WaveVM Swarm V29.5 'Wavelet' Node Daemon (PhysID: %d)\n", my_phys_id);
 
     // 2. 初始化用户态后端 (User Backend)
     // 注意：此时我们暂时用 PhysID 初始化，后续 load_swarm_config 会填充完整的路由表
@@ -349,7 +408,7 @@ int main(int argc, char **argv) {
     
     // 3. 初始化逻辑核心 (Logic Core)
     // 此时 Total Nodes 尚未知，传 0 作为提示
-    if (gvm_core_init(&u_ops, 0) != 0) {
+    if (wvm_core_init(&u_ops, 0) != 0) {
         fprintf(stderr, "[-] Logic Core init failed.\n");
         return 1;
     }
@@ -383,7 +442,7 @@ int main(int argc, char **argv) {
         int current_v_id_accumulator = 0;
         
         // 定义必须与 load_swarm_config 保持一致
-        #define GVM_RAM_UNIT_GB 4 
+        #define WVM_RAM_UNIT_GB 4 
         
         while (fgets(line, sizeof(line), fp_check)) {
             if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
@@ -400,7 +459,7 @@ int main(int argc, char **argv) {
                 if (ram_gb <= 0) ram_gb = 4;
                 
                 // 计算该节点占用的虚拟槽位
-                int v_count = ram_gb / GVM_RAM_UNIT_GB;
+                int v_count = ram_gb / WVM_RAM_UNIT_GB;
                 if (v_count < 1) v_count = 1;
                 
                 // 如果这就是我自己
@@ -435,13 +494,13 @@ int main(int argc, char **argv) {
 
     // 7. 将真实的虚拟 ID 注入 Logic Core
     // Logic Core 将根据此 ID 判断是否拥有某个 GPA 的管理权 (Directory Owner)
-    gvm_set_my_node_id(my_virtual_id);
+    wvm_set_my_node_id(my_virtual_id);
     printf("[Init] Identity Mapped: PhysID %d -> VirtualID %d (Primary)\n", my_phys_id, my_virtual_id);
 
     // 8. 初始化共享内存 (RAM Backing Store)
     // 优先读取环境变量，支持单机多实例测试
-    const char *shm_path = getenv("GVM_SHM_FILE");
-    if (!shm_path) shm_path = GVM_DEFAULT_SHM_PATH; // "/giantvm_ram"
+    const char *shm_path = getenv("WVM_SHM_FILE");
+    if (!shm_path) shm_path = WVM_DEFAULT_SHM_PATH; // "/wavevm_ram"
 
     printf("[System] Initializing SHM: %s (Size: %lu MB)\n", shm_path, ram_mb);
 
@@ -485,9 +544,9 @@ int main(int argc, char **argv) {
     addr.sun_family = AF_UNIX;
     
     // 动态生成 Socket 路径，支持多实例
-    char *inst_id = getenv("GVM_INSTANCE_ID");
+    char *inst_id = getenv("WVM_INSTANCE_ID");
     char sock_path[128];
-    snprintf(sock_path, sizeof(sock_path), "/tmp/gvm_user_%s.sock", inst_id ? inst_id : "0");
+    snprintf(sock_path, sizeof(sock_path), "/tmp/wvm_user_%s.sock", inst_id ? inst_id : "0");
 
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
     unlink(sock_path); // 绑定前确保文件不存在
@@ -495,7 +554,7 @@ int main(int argc, char **argv) {
     printf("[System] Control Socket: %s\n", sock_path);
 
     // 关键：设置环境变量供子进程 (QEMU) 使用
-    setenv("GVM_ENV_SOCK_PATH", sock_path, 1);
+    setenv("WVM_ENV_SOCK_PATH", sock_path, 1);
 
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { 
         perror("bind unix socket failed"); 
@@ -507,11 +566,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("[+] GiantVM V29 Node Ready. Waiting for QEMU...\n");
+    printf("[+] WaveVM V29 Node Ready. Waiting for QEMU...\n");
 
     // 10. 初始化 Backend 和 Logic Core
     user_backend_init(my_phys_id, local_port);
-    gvm_core_init(&u_ops, 0);
+    wvm_core_init(&u_ops, 0);
 
     // 11. [自治扩展] 加载种子节点，不要求全量配置
     load_initial_seeds(config_file);
@@ -521,12 +580,7 @@ int main(int argc, char **argv) {
     pthread_create(&monitor_tid, NULL, autonomous_monitor_thread, NULL);
     pthread_detach(monitor_tid);
 
-    // 13. [Bootstrap] 如果有邻居，立即发起一次视图同步
-    if (g_peer_count > 0) {
-        printf("[Autonomous] Swarm Bootstrap: Requesting full view from seed nodes...\n");
-        extern void request_view_from_neighbor(uint32_t peer_id);
-        request_view_from_neighbor(g_peer_view[0].node_id);
-    }
+    // 13. [Bootstrap] 视图主动拉取逻辑暂时禁用（需跨模块可见 peer 结构体）。
 
     printf("[Autonomous] Node started in SHADOW mode. Auto-scaling into cluster...\n");
 
@@ -561,4 +615,3 @@ int main(int argc, char **argv) {
 
     return 0;
 }
-

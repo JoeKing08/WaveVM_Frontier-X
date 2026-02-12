@@ -1,4 +1,3 @@
-
 /*
  * [IDENTITY] Gateway Sidecar - The Stateless Router
  * ---------------------------------------------------------------------------
@@ -29,7 +28,7 @@
 #include <time.h>
 
 #include "aggregator.h"
-#include "../common_include/giantvm_protocol.h"
+#include "../common_include/wavevm_protocol.h"
 #include "uthash.h"
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -51,10 +50,12 @@ typedef struct {
 static gateway_node_t *g_node_map = NULL; // IMPORTANT: Must be initialized to NULL
 // [REVISED PATCH] 使用读写锁替代互斥锁，保障数据面性能
 static pthread_rwlock_t g_map_lock = PTHREAD_RWLOCK_INITIALIZER; // A global lock to protect the hash map itself (for creation/deletion)
+#define BATCH_SIZE 64
 
 static struct sockaddr_in g_upstream_addr; // The address of the upstream gateway or master
 static volatile int g_primary_socket = -1; 
 static int g_local_port = 0;
+int g_ctrl_port = 0; // 供应给 wavevm_gateway
 
 static int g_is_single_core = 0;
 
@@ -88,7 +89,7 @@ static gateway_node_t* find_or_create_node(uint32_t slave_id) {
     }
 
     // Node not found, need to create it under the global map lock.
-    pthread_mutex_lock(&g_map_lock);
+    pthread_rwlock_wrlock(&g_map_lock);
     
     // Double-check after acquiring the lock to handle race condition
     HASH_FIND_INT(g_node_map, &slave_id, node);
@@ -104,7 +105,7 @@ static gateway_node_t* find_or_create_node(uint32_t slave_id) {
         }
     }
     
-    pthread_mutex_unlock(&g_map_lock);
+    pthread_rwlock_unlock(&g_map_lock);
     return node;
 }
 
@@ -286,7 +287,11 @@ static int internal_push(int fd, uint32_t slave_id, void *data, int len) {
     return 0;
 }
 
+extern void internal_process_single_packet(struct wvm_header *hdr, uint32_t src_ip);
+
 int push_to_aggregator(uint32_t slave_id, void *data, int len) {
+    extern int g_my_node_id;
+
     if (g_primary_socket < 0) return -1;
     return internal_push(g_primary_socket, slave_id, data, len);
 }
@@ -313,7 +318,7 @@ void flush_all_buffers(void) {
 /* 
  * [物理意图] 实现无中心网络的“身份识别”与“路由热修复”。
  * [关键逻辑] 监听并捕获所有入站流量，自动提取源 ID 与物理 IP。若发现邻居坐标变更，立即更新路由表。
- * [后果] 这是 GiantVM 能够支撑百万节点的奥秘。它不再依赖人工配置，而是通过“谁发包，我认识谁”实现拓扑的自动收敛。
+ * [后果] 这是 WaveVM 能够支撑百万节点的奥秘。它不再依赖人工配置，而是通过“谁发包，我认识谁”实现拓扑的自动收敛。
  */
 static void learn_route(uint32_t slave_id, struct sockaddr_in *addr) {
     // 1. 快速检查：如果已有路由且未变，直接返回 (无锁读)
@@ -389,11 +394,11 @@ static void* gateway_worker(void *arg) {
     struct mmsghdr msgs[BATCH_SIZE];
     struct iovec iovecs[BATCH_SIZE];
     struct sockaddr_in src_addrs[BATCH_SIZE];
-    uint8_t *buffer_pool = malloc(BATCH_SIZE * GVM_MAX_PACKET_SIZE);
+    uint8_t *buffer_pool = malloc(BATCH_SIZE * WVM_MAX_PACKET_SIZE);
 
     for (int i = 0; i < BATCH_SIZE; i++) {
-        iovecs[i].iov_base = buffer_pool + (i * GVM_MAX_PACKET_SIZE);
-        iovecs[i].iov_len = GVM_MAX_PACKET_SIZE;
+        iovecs[i].iov_base = buffer_pool + (i * WVM_MAX_PACKET_SIZE);
+        iovecs[i].iov_len = WVM_MAX_PACKET_SIZE;
         msgs[i].msg_hdr.msg_iov = &iovecs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_name = &src_addrs[i];
@@ -412,16 +417,16 @@ static void* gateway_worker(void *arg) {
             int pkt_len = msgs[i].msg_len;
             struct sockaddr_in *src = &src_addrs[i];
 
-            if (pkt_len < sizeof(struct gvm_header)) continue;
-            struct gvm_header *hdr = (struct gvm_header *)ptr;
-            if (ntohl(hdr->magic) != GVM_MAGIC) continue;
+            if (pkt_len < sizeof(struct wvm_header)) continue;
+            struct wvm_header *hdr = (struct wvm_header *)ptr;
+            if (ntohl(hdr->magic) != WVM_MAGIC) continue;
 
             uint32_t slave_id = ntohl(hdr->slave_id); // 发送者的 ID
             
-            // [关键]：只要收到合法的 GVM 包，就学习源路由
+            // [关键]：只要收到合法的 WVM 包，就学习源路由
             // 排除掉 Upstream (Master/Core) 的 ID，只学习 Downstream (Leaf) 节点
             // 这里可以通过 ID 范围判断，或者简单地全部学习（Upstream 路由更新也无妨）
-            if (slave_id < GVM_MAX_SLAVES) {
+            if (slave_id < WVM_MAX_SLAVES) {
                 learn_route(slave_id, &src_addrs[i]);
             }
 
@@ -440,16 +445,16 @@ static void* gateway_worker(void *arg) {
 
 // [PATCH] 新增控制协议定义
 typedef struct {
-    uint32_t magic;      // 0x47564D43 "GVMC" (GiantVM Control)
+    uint32_t magic;      // 0x57564D43 "WVMC" (WaveVM Control)
     uint16_t op_code;    // 1 = ADD_ROUTE, 2 = DEL_ROUTE
     uint32_t node_id;    // 目标虚拟节点 ID
     uint32_t ip;         // 网络序 IP
     uint16_t port;       // 网络序 Port
-} __attribute__((packed)) gvm_gateway_ctrl_pkt;
+} __attribute__((packed)) wvm_gateway_ctrl_pkt;
 
 /* 
  * [物理意图] 提供“上帝视角”的外部干预入口，处理大规模机柜级扩容。
- * [关键逻辑] 在 9001 独立控制端口（TODO：可以实现自行配置）上监听 GVMC 指令，通过写锁（Wrlock）强制注入跨 Pod 的联邦路由。
+ * [关键逻辑] 在 9001 独立控制端口（可自行配置)上监听 WVMC 指令，通过写锁（Wrlock）强制注入跨 Pod 的联邦路由。
  * [后果] 实现了分形架构的层级级联。通过此接口，自动化运维工具可以将分散的 Pod 编织成一个巨大的戴森球算力网。
  */
 void dynamic_add_route(uint32_t node_id, uint32_t ip, uint16_t port) {
@@ -485,23 +490,24 @@ void dynamic_add_route(uint32_t node_id, uint32_t ip, uint16_t port) {
 // [PATCH] 控制平面监听线程
 static void* control_plane_thread(void *arg) {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) return NULL;
     struct sockaddr_in addr = { 
         .sin_family = AF_INET, 
         .sin_addr.s_addr = INADDR_ANY, 
-        .sin_port = htons(9001) // 独立控制端口
+        .sin_port = htons(g_ctrl_port) 
     };
-    
+
     if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("[Gateway] Control plane bind failed");
-        return NULL;
+        perror("[Gateway] FATAL: Control plane bind failed (Port occupied?)");
+        exit(1); // 端口冲突直接退出
     }
     
-    printf("[Gateway] Control Plane Active on Port 9001\n");
+    printf("[Gateway] Control Plane Active on Port %d (Static)\n", g_ctrl_port);
     
-    gvm_gateway_ctrl_pkt pkt;
+    wvm_gateway_ctrl_pkt pkt;
     while (1) {
         ssize_t n = recv(sockfd, &pkt, sizeof(pkt), 0);
-        if (n == sizeof(pkt) && ntohl(pkt.magic) == GVM_CTRL_MAGIC) {
+        if (n == sizeof(pkt) && ntohl(pkt.magic) == WVM_CTRL_MAGIC) {
             if (ntohs(pkt.op_code) == 1) { // ADD / UPDATE
                 dynamic_add_route(ntohl(pkt.node_id), pkt.ip, pkt.port);
             } 
@@ -539,5 +545,4 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
     pthread_create(&ctrl_tid, NULL, control_plane_thread, NULL);
     pthread_detach(ctrl_tid);
 
-    return 0;
-}
+    return 0;}

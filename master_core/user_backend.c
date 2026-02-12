@@ -1,4 +1,3 @@
-
 /*
  * [IDENTITY] User Backend - The High-Concurrency QoS Bus
  * ---------------------------------------------------------------------------
@@ -31,8 +30,8 @@
 #include <sys/sysinfo.h>
 
 #include "unified_driver.h"
-#include "../common_include/giantvm_protocol.h"
-#include "../common_include/crc32.h"
+#include "../common_include/wavevm_protocol.h"
+#include "../common_include/wavevm_ioctl.h"
 
 // --- 配置常量 ---
 #define MAX_INFLIGHT_REQS 65536
@@ -40,21 +39,29 @@
 #define SHARD_MASK (POOL_SHARDS - 1)
 #define ITEMS_PER_SHARD 1563 
 #define POOL_CAP (POOL_SHARDS * ITEMS_PER_SHARD)
-#define POOL_ITEM_SIZE 4200
 #define BATCH_SIZE 64
 #define RX_THREAD_COUNT 4
 
 // --- 全局状态 ---
 static int g_my_node_id = 0;
 static int g_local_port = 0;
-static struct sockaddr_in g_gateways[GVM_MAX_GATEWAYS];
+static struct sockaddr_in g_gateways[WVM_MAX_GATEWAYS];
 static volatile int g_tx_socket = -1;
+int g_slave_forward_port = 0;
+uint32_t g_curr_epoch = 0;
+uint8_t g_my_node_state = 1;
+
+__attribute__((weak)) int push_to_aggregator(uint32_t slave_id, void *data, int len) {
+    (void)slave_id; (void)data; (void)len;
+    errno = EAGAIN;
+    return -EAGAIN;
+}
 
 // --- 外部引用 ---
 extern void *g_shm_ptr; 
 extern size_t g_shm_size;
 extern void broadcast_irq_to_qemu(void);
-extern void gvm_logic_process_packet(struct gvm_header *hdr, void *payload, uint32_t source_node_id);
+extern void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t source_node_id);
 extern void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len);
 
 // --- 请求ID管理结构 ---
@@ -80,6 +87,8 @@ static pool_shard_t g_pool_shards[POOL_SHARDS];
 static uint8_t *g_pool_buffer = NULL;
 static void *g_free_list[POOL_CAP];
 static int g_pool_top = -1;
+
+static int u_send_packet(void *data, int len, uint32_t target_id);
 static pthread_spinlock_t g_pool_lock;
 
 // --- QoS 发送队列结构 ---
@@ -321,13 +330,13 @@ static int u_check_req_status(uint64_t id) {
 }
 
 static void u_send_packet_async(uint16_t msg_type, void* payload, int len, uint32_t target_id, uint8_t qos) {
-    size_t pkt_len = sizeof(struct gvm_header) + len;
+    size_t pkt_len = sizeof(struct wvm_header) + len;
     uint8_t *buffer = u_alloc_packet(pkt_len, 1);
     if (!buffer) return;
 
-    struct gvm_header *hdr = (struct gvm_header *)buffer;
+    struct wvm_header *hdr = (struct wvm_header *)buffer;
     extern int g_my_node_id; 
-    hdr->magic = htonl(GVM_MAGIC);
+    hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(msg_type);
     hdr->payload_len = htons(len);
     hdr->slave_id = htonl(g_my_node_id);
@@ -375,10 +384,9 @@ static int raw_send(tx_node_t *node) {
     if (target->sin_port == 0 || g_tx_socket < 0) return -1;
     
     // [自治增强]：在发送前强制注入当前的本地 Epoch 和状态
-    struct gvm_header *hdr = (struct gvm_header *)node->data;
-    extern uint32_t g_curr_epoch;      // 引用自 logic_core
-    extern uint8_t  g_my_node_state;  // 引用自 logic_core
-    
+    struct wvm_header *hdr = (struct wvm_header *)node->data;
+    // 使用本文件中的轻量状态镜像，避免跨对象链接耦合。
+
     hdr->epoch = g_curr_epoch;
     hdr->node_state = g_my_node_state;
     
@@ -387,7 +395,6 @@ static int raw_send(tx_node_t *node) {
     hdr->crc32 = htonl(calculate_crc32(node->data, node->len));
     
     // 感知 Gateway 的反压返回值
-    extern int push_to_aggregator(uint32_t slave_id, void *data, int len);
     
     int retries = 0;
     while (1) {
@@ -422,7 +429,7 @@ static void* tx_worker_thread(void *arg) {
         
         // 1. 优先清空 Fast Queue
         while ((node = queue_pop(&g_fast_queue)) != NULL) {
-            struct gvm_header* hdr = (struct gvm_header*)node->data;
+            struct wvm_header* hdr = (struct wvm_header*)node->data;
             // 计算 CRC32
             hdr->crc32 = 0;
             hdr->crc32 = htonl(calculate_crc32(node->data, node->len));
@@ -434,7 +441,7 @@ static void* tx_worker_thread(void *arg) {
         // 2. 按配额处理 Slow Queue
         int quota = 16;
         while (quota > 0 && (node = queue_pop(&g_slow_queue)) != NULL) {
-            struct gvm_header* hdr = (struct gvm_header*)node->data;
+            struct wvm_header* hdr = (struct wvm_header*)node->data;
             // 计算 CRC32
             hdr->crc32 = 0;
             hdr->crc32 = htonl(calculate_crc32(node->data, node->len));
@@ -461,7 +468,7 @@ static void* tx_worker_thread(void *arg) {
 static int u_send_packet(void *data, int len, uint32_t target_id) {
     if (g_tx_socket < 0) return -1;
     
-    struct gvm_header *hdr = (struct gvm_header *)data;
+    struct wvm_header *hdr = (struct wvm_header *)data;
     tx_queue_t *q;
     int is_atomic = 0;
 
@@ -501,7 +508,7 @@ static int u_send_packet(void *data, int len, uint32_t target_id) {
     return 0;
 }
 
-// [FIX] 引用全局设备描述符 (在 main_wrapper.c 中打开 /dev/giantvm)
+// [FIX] 引用全局设备描述符 (在 main_wrapper.c 中打开 /dev/wavevm)
 extern int g_dev_fd; 
 
 /* 
@@ -511,7 +518,7 @@ extern int g_dev_fd;
  */
 static void u_set_gateway_ip(uint32_t gw_id, uint32_t ip, uint16_t port) {
     // 1. 更新用户态表 (供 Daemon 自身通信使用，如 Gossip)
-    if (gw_id < GVM_MAX_GATEWAYS) {
+    if (gw_id < WVM_MAX_GATEWAYS) {
         g_gateways[gw_id].sin_family = AF_INET;
         g_gateways[gw_id].sin_addr.s_addr = ip;
         g_gateways[gw_id].sin_port = port;
@@ -520,7 +527,7 @@ static void u_set_gateway_ip(uint32_t gw_id, uint32_t ip, uint16_t port) {
     // 2. [关键] 如果是 Mode A，必须同步下发到内核！
     // 通过判断 g_dev_fd 是否有效来识别是否开启了内核加速
     if (g_dev_fd > 0) {
-        struct gvm_ioctl_gateway args;
+        struct wvm_ioctl_gateway args;
         args.gw_id = gw_id;
         args.ip = ip;     // 此时已经是网络序
         args.port = port; // 此时已经是网络序
@@ -543,40 +550,40 @@ static void u_invalidate_local(uint64_t gpa) {
     // No-op for user backend, logic core handles this
 }
 
-extern uint64_t gvm_logic_get_page_version(uint64_t gpa);
+extern uint64_t wvm_logic_get_page_version(uint64_t gpa);
 
 /* 
  * [物理意图] 充当本地物理内存的“分布式 DMA 控制器”。
  * [关键逻辑] 响应远程读请求，从共享内存（SHM）中提取数据，并强制附加 Logic Core 维护的最新的版本号（Version）。
  * [后果] 提供了真理的来源。这是 Wavelet 协议中“拉取（Pull）”链路的终点，保证了 Directory 数据的对外可见性。
  */
-static void handle_slave_read(int fd, struct sockaddr_in *dest, struct gvm_header *req) {
+static void handle_slave_read(int fd, struct sockaddr_in *dest, struct wvm_header *req) {
     if (!g_shm_ptr) return;
 
     // 1. 从请求中解析 GPA
-    uint64_t gpa = GVM_NTOHLL(*(uint64_t*)(req + 1));
+    uint64_t gpa = WVM_NTOHLL(*(uint64_t*)(req + 1));
     if (gpa + 4096 > g_shm_size) return;
 
     // 2. 准备完整的响应包缓冲区 (Header + Payload结构体)
     // 大小 = 24 (Header) + 16 (GPA/Ver) + 4096 (Data) = 4136 字节
-    uint8_t tx_buffer[sizeof(struct gvm_header) + sizeof(struct gvm_mem_ack_payload)];
+    uint8_t tx_buffer[sizeof(struct wvm_header) + sizeof(struct wvm_mem_ack_payload)];
     memset(tx_buffer, 0, sizeof(tx_buffer));
 
-    struct gvm_header *ack_hdr = (struct gvm_header *)tx_buffer;
-    struct gvm_mem_ack_payload *ack_pl = (struct gvm_mem_ack_payload *)(tx_buffer + sizeof(struct gvm_header));
+    struct wvm_header *ack_hdr = (struct wvm_header *)tx_buffer;
+    struct wvm_mem_ack_payload *ack_pl = (struct wvm_mem_ack_payload *)(tx_buffer + sizeof(struct wvm_header));
 
     // 3. 填充 Payload (关键！)
-    ack_pl->gpa = GVM_HTONLL(gpa);
+    ack_pl->gpa = WVM_HTONLL(gpa);
     // 从 Logic Core 获取当前权威版本号，这对于 V29 的订阅机制至关重要
-    ack_pl->version = GVM_HTONLL(gvm_logic_get_page_version(gpa));
+    ack_pl->version = WVM_HTONLL(wvm_logic_get_page_version(gpa));
     // 拷贝真正的内存数据
     memcpy(ack_pl->data, (uint8_t*)g_shm_ptr + gpa, 4096);
 
     // 4. 填充 Header
-    ack_hdr->magic = htonl(GVM_MAGIC);
+    ack_hdr->magic = htonl(WVM_MAGIC);
     ack_hdr->msg_type = htons(MSG_MEM_ACK);
     // 注意：payload_len 现在是 4112 字节 (16 + 4096)，而不是 4096！
-    ack_hdr->payload_len = htons(sizeof(struct gvm_mem_ack_payload));
+    ack_hdr->payload_len = htons(sizeof(struct wvm_mem_ack_payload));
     ack_hdr->req_id = req->req_id;
     ack_hdr->slave_id = htonl(g_my_node_id);
     ack_hdr->qos_level = 0; // 慢车道包
@@ -591,30 +598,30 @@ static void handle_slave_read(int fd, struct sockaddr_in *dest, struct gvm_heade
 }
 
 // 引用 Logic Core
-extern void gvm_logic_update_local_version(uint64_t gpa);
-extern void gvm_logic_broadcast_rpc(void *payload_data, int payload_len, uint16_t msg_type);
+extern void wvm_logic_update_local_version(uint64_t gpa);
+extern void wvm_logic_broadcast_rpc(void *payload_data, int payload_len, uint16_t msg_type);
 
 /* 
  * [物理意图] 执行“语义透传”指令，实现内存状态的“瞬时坍缩”。
  * [关键逻辑] 利用 mprotect(PROT_WRITE) 构建写锁栅栏，在物理 memset 期间暂时禁用读取，确保全网一致性视图。
- * [后果] 这是 GiantVM 突破物理带宽限制的神作。它让 GB 级的内存清零操作在 10µs 内在全网节点同步完成，效率提升万倍。
+ * [后果] 这是 WaveVM 突破物理带宽限制的神作。它让 GB 级的内存清零操作在 10µs 内在全网节点同步完成，效率提升万倍。
  */
 static void handle_rpc_batch_execution(void *payload, uint32_t payload_len) {
-    if (payload_len < sizeof(struct gvm_rpc_batch_memset)) return;
+    if (payload_len < sizeof(struct wvm_rpc_batch_memset)) return;
 
-    struct gvm_rpc_batch_memset *batch = (struct gvm_rpc_batch_memset *)payload;
+    struct wvm_rpc_batch_memset *batch = (struct wvm_rpc_batch_memset *)payload;
     uint32_t count = ntohl(batch->count);
     uint32_t val = ntohl(batch->val);
     
     // 边界检查：防止 count 过大导致越界读取
-    size_t required_len = sizeof(struct gvm_rpc_batch_memset) + count * sizeof(struct gvm_rpc_region);
+    size_t required_len = sizeof(struct wvm_rpc_batch_memset) + count * sizeof(struct wvm_rpc_region);
     if (payload_len < required_len) return;
 
-    struct gvm_rpc_region *regions = (struct gvm_rpc_region *)(batch + 1);
+    struct wvm_rpc_region *regions = (struct wvm_rpc_region *)(batch + 1);
     
     for (uint32_t i = 0; i < count; i++) {
-        uint64_t gpa = GVM_NTOHLL(regions[i].gpa);
-        uint64_t r_len = GVM_NTOHLL(regions[i].len);
+        uint64_t gpa = WVM_NTOHLL(regions[i].gpa);
+        uint64_t r_len = WVM_NTOHLL(regions[i].len);
         
         if (gpa + r_len > g_shm_size) continue;
         
@@ -641,7 +648,7 @@ static void handle_rpc_batch_execution(void *payload, uint32_t payload_len) {
         
         // 5. 更新版本号
         for (uint64_t offset = 0; offset < r_len; offset += 4096) {
-            gvm_logic_update_local_version(gpa + offset);
+            wvm_logic_update_local_version(gpa + offset);
         }
     }
     
@@ -652,11 +659,11 @@ static void handle_rpc_batch_execution(void *payload, uint32_t payload_len) {
 
 // [IPC Source] 处理来自本地 QEMU 的请求
 static void handle_ipc_rpc_passthrough(int qemu_fd, void *data, uint32_t len) {
-    if (len < sizeof(struct gvm_header)) return;
-    struct gvm_header *hdr = (struct gvm_header *)data;
+    if (len < sizeof(struct wvm_header)) return;
+    struct wvm_header *hdr = (struct wvm_header *)data;
     uint16_t msg_type = ntohs(hdr->msg_type);
-    void *payload = (void*)hdr + sizeof(struct gvm_header);
-    uint32_t payload_len = len - sizeof(struct gvm_header);
+    void *payload = (void*)hdr + sizeof(struct wvm_header);
+    uint32_t payload_len = len - sizeof(struct wvm_header);
 
     if (msg_type == MSG_RPC_BATCH_MEMSET) {
         // 1. 本地执行
@@ -664,7 +671,7 @@ static void handle_ipc_rpc_passthrough(int qemu_fd, void *data, uint32_t len) {
         
         // 2. [Broadcast] 全网广播 (Source ID = Me)
         hdr->slave_id = htonl(g_my_node_id);
-        gvm_logic_broadcast_rpc(data, len, msg_type);
+        wvm_logic_broadcast_rpc(data, len, msg_type);
     }
     
     // 3. [ACK] 解除 QEMU 阻塞
@@ -718,7 +725,7 @@ static void* rx_thread_loop(void *arg) {
     struct mmsghdr msgs[BATCH_SIZE];
     struct iovec iovecs[BATCH_SIZE];
     struct sockaddr_in src_addrs[BATCH_SIZE];
-    uint8_t *buffer_pool = malloc(BATCH_SIZE * GVM_MAX_PACKET_SIZE);
+    uint8_t *buffer_pool = malloc(BATCH_SIZE * WVM_MAX_PACKET_SIZE);
     
     if (!buffer_pool) {
         perror("RX buffer pool malloc failed");
@@ -727,8 +734,8 @@ static void* rx_thread_loop(void *arg) {
     }
 
     for (int i = 0; i < BATCH_SIZE; i++) {
-        iovecs[i].iov_base = buffer_pool + (i * GVM_MAX_PACKET_SIZE);
-        iovecs[i].iov_len = GVM_MAX_PACKET_SIZE;
+        iovecs[i].iov_base = buffer_pool + (i * WVM_MAX_PACKET_SIZE);
+        iovecs[i].iov_len = WVM_MAX_PACKET_SIZE;
         msgs[i].msg_hdr.msg_iov = &iovecs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_name = &src_addrs[i];
@@ -752,19 +759,19 @@ static void* rx_thread_loop(void *arg) {
             uint32_t src_ip = src_addrs[i].sin_addr.s_addr;    // 源IP
 
             // 循环解包：只要剩余数据够一个Header，就继续解析
-            while (offset + sizeof(struct gvm_header) <= total_len) {
+            while (offset + sizeof(struct wvm_header) <= total_len) {
             
                 // 计算当前包头的实际位置
-                struct gvm_header *hdr = (struct gvm_header *)(base_ptr + offset);
+                struct wvm_header *hdr = (struct wvm_header *)(base_ptr + offset);
             
                 // 1. 魔数校验 (快速失败，防止处理垃圾数据)
-                if (ntohl(hdr->magic) != GVM_MAGIC) {
+                if (ntohl(hdr->magic) != WVM_MAGIC) {
                     break; // 如果魔数不对，说明后续数据无法对齐，直接丢弃该 UDP 包剩余部分
                 }
 
-                // 计算当前这个 GVM 子包的长度
+                // 计算当前这个 WVM 子包的长度
                 uint16_t p_len = ntohs(hdr->payload_len);
-                int current_pkt_len = sizeof(struct gvm_header) + p_len;
+                int current_pkt_len = sizeof(struct wvm_header) + p_len;
 
                 // 2. 长度越界校验
                 if (offset + current_pkt_len > total_len) {
@@ -776,7 +783,7 @@ static void* rx_thread_loop(void *arg) {
                 hdr->crc32 = 0; // 计算前清零
                 uint32_t calculated_crc = calculate_crc32((uint8_t*)hdr, current_pkt_len);
             
-                uint64_t rid = GVM_NTOHLL(hdr->req_id); // 定义 rid
+                uint64_t rid = WVM_NTOHLL(hdr->req_id); // 定义 rid
                 uint16_t msg_type = ntohs(hdr->msg_type); // 定义 msg_type
 
                 if (received_crc == calculated_crc) {
@@ -791,7 +798,7 @@ static void* rx_thread_loop(void *arg) {
                     }
                     // 校验通过，恢复 CRC
                     hdr->crc32 = htonl(received_crc);
-                    void *payload = (void*)hdr + sizeof(struct gvm_header);
+                    void *payload = (void*)hdr + sizeof(struct wvm_header);
                 
                     // 分发逻辑
                     if (rid != 0 && rid != (uint64_t)-1) {
@@ -801,8 +808,8 @@ static void* rx_thread_loop(void *arg) {
                         if (g_u_req_ctx[idx].rx_buffer && g_u_req_ctx[idx].full_id == rid) {
                     
                             // [V29 Final Fix] 处理带版本的 ACK
-                            if (msg_type == MSG_MEM_ACK && p_len == sizeof(struct gvm_mem_ack_payload)) {
-                                struct gvm_mem_ack_payload *ack_p = (struct gvm_mem_ack_payload*)payload;
+                            if (msg_type == MSG_MEM_ACK && p_len == sizeof(struct wvm_mem_ack_payload)) {
+                                struct wvm_mem_ack_payload *ack_p = (struct wvm_mem_ack_payload*)payload;
                                 memcpy(g_u_req_ctx[idx].rx_buffer, ack_p->data, 4096);
                                 // 版本号可以通过 IPC 传递给 QEMU，或者由调用方通过共享内存处理
                                 // 这里我们完成了数据拷贝，通知调用方完成
@@ -815,25 +822,40 @@ static void* rx_thread_loop(void *arg) {
                         pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
 
                     } else {
+                        // [V30 核心修复] 如果是给 Slave 的活，转发到命令行指定的端口
+                        if (msg_type == MSG_VCPU_RUN || msg_type == MSG_BLOCK_WRITE || 
+                            msg_type == MSG_BLOCK_READ || msg_type == MSG_BLOCK_FLUSH) {
+                            
+                            struct sockaddr_in slave_addr = {
+                                .sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+                                .sin_port = htons(g_slave_forward_port)
+                            };
+                            sendto(sockfd, base_ptr + offset, current_pkt_len, 0, 
+                                  (struct sockaddr*)&slave_addr, sizeof(slave_addr));
+
+                            offset += current_pkt_len;
+                            continue; // 转发完直接跳过，Master不处理
+                        }
                         // [V29 FINAL FIX] 客户端推送处理逻辑
                         // 如果是推送/失效消息，Daemon 必须自己处理（更新 SHM + 通知 QEMU）
                         // 而不能扔给只懂服务端业务的 logic_core
 
-                        void *payload = base_ptr + offset + sizeof(struct gvm_header);
+                        void *payload = base_ptr + offset + sizeof(struct wvm_header);
                         uint16_t p_len = ntohs(hdr->payload_len);
                         if (msg_type == MSG_PAGE_PUSH_FULL) {
-                            struct gvm_full_page_push *push = (struct gvm_full_page_push *)payload;
-                            uint64_t gpa = GVM_NTOHLL(push->gpa);
+                            struct wvm_full_page_push *push = (struct wvm_full_page_push *)payload;
+                            uint64_t gpa = WVM_NTOHLL(push->gpa);
                             if (gpa + 4096 <= g_shm_size) {
                                 // 1. 更新本地 SHM (成为最新版本)
                                 memcpy((uint8_t*)g_shm_ptr + gpa, push->data, 4096);
                                 // 2. 转发给 QEMU (IPC) 以更新版本号/TLB
-                                broadcast_push_to_qemu(msg_type, payload, sizeof(struct gvm_full_page_push));
+                                broadcast_push_to_qemu(msg_type, payload, sizeof(struct wvm_full_page_push));
                             }
                         } 
                         else if (msg_type == MSG_PAGE_PUSH_DIFF) {
-                            struct gvm_diff_log *log = (struct gvm_diff_log *)payload;
-                            uint64_t gpa = GVM_NTOHLL(log->gpa);
+                            struct wvm_diff_log *log = (struct wvm_diff_log *)payload;
+                            uint64_t gpa = WVM_NTOHLL(log->gpa);
                             uint16_t off = ntohs(log->offset);
                             uint16_t sz = ntohs(log->size);
                     
@@ -842,7 +864,7 @@ static void* rx_thread_loop(void *arg) {
                                 memcpy((uint8_t*)g_shm_ptr + gpa + off, log->data, sz);
                                 // 2. 转发给 QEMU
                                 // 注意：这里需要计算正确的 payload 长度 (header + data)
-                                broadcast_push_to_qemu(msg_type, payload, sizeof(struct gvm_diff_log) + sz);
+                                broadcast_push_to_qemu(msg_type, payload, sizeof(struct wvm_diff_log) + sz);
                             }
                         }
                         else if (msg_type == MSG_INVALIDATE || msg_type == MSG_DOWNGRADE || msg_type == MSG_FORCE_SYNC) {
@@ -867,16 +889,11 @@ static void* rx_thread_loop(void *arg) {
                         else {
                             // 其他消息 (DECLARE/COMMIT) 才是给服务端 Logic Core 的
                             uint32_t src_id = ntohl(hdr->slave_id);
-                            gvm_logic_process_packet(hdr, payload, src_id);
+                            wvm_logic_process_packet(hdr, payload, src_id);
                         }
                     }
                 }
     
-                } else {
-                    // 仅打印日志，不中断循环，尝试处理下一个包(虽然通常意味着数据已乱)
-                    u_log("[Warn] CRC failed in aggregated packet");
-                }
-
                 // 4. [关键] 指针移动到下一个包
                 offset += current_pkt_len;
             }
@@ -887,8 +904,8 @@ static void* rx_thread_loop(void *arg) {
 }
 
 // 供 logic_core 调用
-void gvm_notify_kernel_epoch(uint32_t epoch) {
-    // g_dev_fd 是打开 /dev/giantvm 的句柄，需要在初始化时保存
+void wvm_notify_kernel_epoch(uint32_t epoch) {
+    // g_dev_fd 是打开 /dev/wavevm 的句柄，需要在初始化时保存
     extern int g_dev_fd; 
     if (g_dev_fd > 0) {
         ioctl(g_dev_fd, IOCTL_UPDATE_EPOCH, &epoch);
@@ -905,7 +922,6 @@ struct dsm_driver_ops u_ops = {
     .send_packet = u_send_packet,
     .fetch_page = u_fetch_page,
     .invalidate_local = u_invalidate_local,
-    .handle_page_fault = NULL, 
     .log = u_log,
     .is_atomic_context = u_is_atomic_context,
     .touch_watchdog = u_touch_watchdog,
@@ -966,4 +982,3 @@ int user_backend_init(int my_node_id, int port) {
     
     return 0;
 }
-

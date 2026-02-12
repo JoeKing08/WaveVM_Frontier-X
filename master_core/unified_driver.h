@@ -1,4 +1,3 @@
-
 #ifndef UNIFIED_DRIVER_H
 #define UNIFIED_DRIVER_H
 #include "../common_include/platform_defs.h"
@@ -15,7 +14,7 @@ struct dsm_driver_ops {
     void     (*fetch_page)(uint64_t gpa, void *buf); 
     void     (*invalidate_local)(uint64_t gpa);
     // handle_page_fault is now part of the logic_core, not the driver ops
-    void     (*log)(const char *fmt, ...) GVM_PRINTF_LIKE(1, 2);
+    void     (*log)(const char *fmt, ...) WVM_PRINTF_LIKE(1, 2);
     int      (*is_atomic_context)(void);
     void     (*touch_watchdog)(void);
 

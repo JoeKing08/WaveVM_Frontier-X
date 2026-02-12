@@ -1,8 +1,7 @@
-
 #!/bin/bash
-# GiantVM V29 Environment Check & Hardening Script
+# WaveVM V29 Environment Check & Hardening Script
 
-echo "[*] GiantVM V29: Tuning Kernel Parameters for Production..."
+echo "[*] WaveVM V29: Tuning Kernel Parameters for Production..."
 
 # 1. 基础资源限制 (Basic Resource Limits)
 # 确保系统能打开足够多的文件句柄

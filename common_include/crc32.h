@@ -1,4 +1,3 @@
-
 /* 文件位置：common_include/crc32.h */
 
 #ifdef __SSE4_2__
@@ -58,3 +57,4 @@ static inline uint32_t calculate_crc32(const void* data, size_t length) {
 }
 
 #endif // CRC32_H
+#endif // __SSE4_2__

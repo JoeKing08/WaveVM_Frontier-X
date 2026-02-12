@@ -1,7 +1,6 @@
-
 CC = gcc
 CFLAGS = -Wall -O2 -I../common_include
-TARGET = gvm_ctl
+TARGET = wvm_ctl
 
 all: $(TARGET)
 
@@ -10,4 +9,3 @@ $(TARGET): main.c
 
 clean:
 	rm -f $(TARGET)
-

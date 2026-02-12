@@ -1,10 +1,9 @@
-
 #ifndef AGGREGATOR_H
 #define AGGREGATOR_H
 
 #include <stdint.h>
 #include <stddef.h>
-#include "../common_include/giantvm_config.h"
+#include "../common_include/wavevm_config.h"
 
 // The structure for an aggregation buffer.
 // Kept the same as V28.
@@ -46,4 +45,3 @@ int push_to_aggregator(uint32_t slave_id, void *data, int len);
 void flush_all_buffers(void);
 
 #endif // AGGREGATOR_H
-
