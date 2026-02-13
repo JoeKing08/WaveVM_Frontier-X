@@ -1859,7 +1859,11 @@ void handle_rpc_batch_execution(void *payload, uint32_t len);
 #define TOTAL_TIMEOUT_US       5000000   // 5s
 
 // --- 目录表定义 ---
-#define DIR_TABLE_SIZE (1024 * 1024 * 64) // 4M Entries
+#ifdef __KERNEL__
+#define DIR_TABLE_SIZE (1024 * 1024 * 64) // Kernel path keeps full table
+#else
+#define DIR_TABLE_SIZE (1024 * 64) // User-mode smoke test friendly size
+#endif
 #define DIR_MAX_PROBE 128
 #define LOCK_SHARDS 65536
 #define SMALL_UPDATE_THRESHOLD 1024 
