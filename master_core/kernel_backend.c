@@ -228,12 +228,11 @@ static void* k_alloc_packet(size_t size, int atomic) {
 }
 static void k_free_packet(void *ptr) {
     if (!ptr) return;
-    struct page *page = virt_to_head_page(ptr);
-    if (page && PageSlab(page) && page->slab_cache == wvm_pkt_cache) {
-        kmem_cache_free(wvm_pkt_cache, ptr);
-    } else {
-        kfree(ptr);
-    }
+    /*
+     * Kernel >= 6.x no longer exposes slab cache pointer in struct page.
+     * kfree() can free both kmalloc() and slab objects, and is sufficient here.
+     */
+    kfree(ptr);
 }
 static void k_fetch_page(uint64_t gpa, void *buf) {} // Deprecated by logic_core
 
