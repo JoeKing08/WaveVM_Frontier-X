@@ -46,6 +46,7 @@
 #include <linux/rmap.h>
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
+#include <linux/cpu.h>
 
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_protocol.h"
@@ -268,6 +269,7 @@ static uint64_t k_alloc_req_id(void *rx_buffer) {
     struct id_pool_t *pool = this_cpu_ptr(&g_id_pool);
 
     spin_lock_irqsave(&pool->lock, flags);
+    if (unlikely(!pool->ids)) goto out;
     if (pool->tail != pool->head) {
         uint32_t raw_idx = pool->ids[pool->head & (MAX_IDS_PER_CPU - 1)];
         pool->head++;
@@ -281,6 +283,7 @@ static uint64_t k_alloc_req_id(void *rx_buffer) {
             smp_wmb(); 
         } else { pool->head--; }
     }
+out:
     spin_unlock_irqrestore(&pool->lock, flags);
     put_cpu();
     return id;
@@ -301,6 +304,7 @@ static void k_free_req_id(uint64_t full_id) {
     WRITE_ONCE(g_req_ctx[combined_idx].done, 0);
 
     pool = per_cpu_ptr(&g_id_pool, owner_cpu);
+    if (unlikely(!pool->ids)) return;
     spin_lock_irqsave(&pool->lock, flags);
     pool->ids[pool->tail & (MAX_IDS_PER_CPU - 1)] = raw_idx;
     pool->tail++;
@@ -1398,12 +1402,16 @@ static int __init wavevm_init(void) {
     spin_lock_init(&g_diff_lock);
     init_rwsem(&g_mapping_sem);
 
-    g_req_ctx_count = (size_t)nr_cpu_ids * (size_t)MAX_IDS_PER_CPU;
+    /*
+     * Use online CPU count for sizing/initialization to keep module load feasible
+     * on kernels with very large CONFIG_NR_CPUS.
+     */
+    g_req_ctx_count = (size_t)num_online_cpus() * (size_t)MAX_IDS_PER_CPU;
     g_req_ctx = vzalloc(sizeof(struct req_ctx_t) * g_req_ctx_count);
     if (!g_req_ctx) return -ENOMEM;
     for (size_t i = 0; i < g_req_ctx_count; i++) init_waitqueue_head(&g_req_ctx[i].wq);
 
-    for_each_possible_cpu(cpu) {
+    for_each_online_cpu(cpu) {
         struct id_pool_t *pool = per_cpu_ptr(&g_id_pool, cpu);
         spin_lock_init(&pool->lock);
         pool->ids = vzalloc(sizeof(uint32_t) * MAX_IDS_PER_CPU);
