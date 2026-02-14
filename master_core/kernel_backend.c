@@ -352,7 +352,9 @@ static int raw_kernel_send(void *data, int len, uint32_t target_id) {
  * [后果] 保证了系统在“内存洪流”中依然能及时响应心跳与版本确认包，防止了由于网络拥塞导致的误判定节点下线。
  */
 static int tx_worker_thread_fn(void *data) {
-    struct tx_slot_t slot;
+    /* Large TX slots (up to 64KB) cannot live on kernel stack. */
+    struct tx_slot_t *slot = kvzalloc(sizeof(*slot), GFP_KERNEL);
+    if (!slot) return -ENOMEM;
     while (!kthread_should_stop()) {
         wait_event_interruptible(g_tx_wq, 
             atomic_read(&g_fast_ring.pending_count) > 0 || 
@@ -365,7 +367,7 @@ static int tx_worker_thread_fn(void *data) {
             int found = 0;
             spin_lock_bh(&g_fast_ring.lock);
             if (g_fast_ring.head != g_fast_ring.tail) {
-                memcpy(&slot, &g_fast_ring.slots[g_fast_ring.head], sizeof(slot));
+                memcpy(slot, &g_fast_ring.slots[g_fast_ring.head], sizeof(*slot));
                 g_fast_ring.head = (g_fast_ring.head + 1) % TX_RING_SIZE;
                 atomic_dec(&g_fast_ring.pending_count);
                 found = 1;
@@ -374,11 +376,11 @@ static int tx_worker_thread_fn(void *data) {
             
             if (found) { 
                 // [V29] CRC Calculation offloaded to worker thread
-                struct wvm_header *hdr = (struct wvm_header *)slot.data;
+                struct wvm_header *hdr = (struct wvm_header *)slot->data;
                 hdr->crc32 = 0;
-                hdr->crc32 = htonl(calculate_crc32(slot.data, slot.len));
+                hdr->crc32 = htonl(calculate_crc32(slot->data, slot->len));
                 
-                raw_kernel_send(slot.data, slot.len, slot.target_id); 
+                raw_kernel_send(slot->data, slot->len, slot->target_id); 
                 cond_resched(); 
             }
         }
@@ -389,7 +391,7 @@ static int tx_worker_thread_fn(void *data) {
             int found = 0;
             spin_lock_bh(&g_slow_ring.lock);
             if (g_slow_ring.head != g_slow_ring.tail) {
-                memcpy(&slot, &g_slow_ring.slots[g_slow_ring.head], sizeof(slot));
+                memcpy(slot, &g_slow_ring.slots[g_slow_ring.head], sizeof(*slot));
                 g_slow_ring.head = (g_slow_ring.head + 1) % TX_RING_SIZE;
                 atomic_dec(&g_slow_ring.pending_count);
                 found = 1;
@@ -398,17 +400,18 @@ static int tx_worker_thread_fn(void *data) {
             
             if (found) {
                 // [V29] CRC Calculation
-                struct wvm_header *hdr = (struct wvm_header *)slot.data;
+                struct wvm_header *hdr = (struct wvm_header *)slot->data;
                 hdr->crc32 = 0;
-                hdr->crc32 = htonl(calculate_crc32(slot.data, slot.len));
+                hdr->crc32 = htonl(calculate_crc32(slot->data, slot->len));
                 
-                raw_kernel_send(slot.data, slot.len, slot.target_id);
+                raw_kernel_send(slot->data, slot->len, slot->target_id);
             }
             // Preempt if fast packet arrives
             if (atomic_read(&g_fast_ring.pending_count) > 0) break;
         }
         k_touch_watchdog();
     }
+    kvfree(slot);
     return 0;
 }
 
