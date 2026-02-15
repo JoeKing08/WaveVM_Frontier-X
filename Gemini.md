@@ -64,7 +64,7 @@ V30.0 不再将物理计算节点视为单一的进程，而是定义为由 **�
             |                                   | (127.0.0.1)     |
             |                                   v                 |
             |                       [ Slave Daemon (Exec) ] <-----+
-            |                       ( Port: 9005 - The MUSCLE )
+            |                       ( Port: 9001 - The MUSCLE )
             |                       ( - KVM Stateless Run     )
             +---------------------> ( - Block IO (O_DIRECT)   )
                                     ( - Dirty Sync (MPSC)     )
@@ -257,7 +257,6 @@ V30.0 的部署继承了 V28 的**分形蜂群（Fractal Swarm）**理念，但�
     NODE 1 127.0.0.1 8000 64 4
     NODE 2 127.0.0.1 8000 4  128
     ```
-    
 *   **配置文件 (`/etc/wavevm/real_routes.txt`)**:
     ```ini
     # 格式: ROUTE BaseID Count GatewayIP Port
@@ -291,7 +290,9 @@ V30.0 的部署继承了 V28 的**分形蜂群（Fractal Swarm）**理念，但�
     # 2. 定义本节点共享内存标识（用于防止单机部署时内存重叠坍缩，多机部署可不使用该项设置，使用默认的 /wavevm_ram）
     export WVM_SHM_FILE="/wavevm_ram_node0"
     # 3. 加载内核模块
-    sudo insmod wavevm.ko service_port=9000 local_slave_port=9005
+    sudo insmod wavevm.ko 
+    service_port=9000 
+    local_slave_port=9005
     # 4. 启动 Master
     # <RAM_MB> <L_PORT> <CONF> <ID> <C_PORT> <SLAVE_PORT> <SYNC_BATCH>
     ./wavevm_node_master 4096 9002 /etc/wavevm/logical_topology.txt 0 9001 9005 64 &
@@ -330,7 +331,6 @@ V30.0 的部署继承了 V28 的**分形蜂群（Fractal Swarm）**理念，但�
 
     END
     ```
-    
 *   **启动命令**:
     ```bash
     sudo mkdir -p /var/lib/wavevm/chunks
@@ -462,7 +462,6 @@ qemu-system-x86_64 \
     ROUTE 400   400   192.168.0.1   9000  # Pod 1 的 100个 phys-nodes 指向它
     ... (其余 Pod 的路由)
     ```
-    
 *   **启动命令**:
     ```bash
     # 上游指向自己，作为根节点
@@ -479,7 +478,6 @@ qemu-system-x86_64 \
     ROUTE 4   4   192.168.0.11   9000 
     ... (其余 Pod 的路由)
     ```
-    
 *   **启动命令**:
     ```bash
     # 上游指向 L2 Core Gateway
@@ -497,14 +495,12 @@ qemu-system-x86_64 \
     ...
     NODE 999 127.0.0.1 8000 4 16
     ```
-    
 *   **启动 Gateway Sidecar**:
     ```bash
     # 配置文件为空，所有流量都转发给上游 (Pod Gateway)
     touch /etc/wavevm/empty.txt
     ./wavevm_gateway 8000 192.168.0.1 9000 /etc/wavevm/empty.txt 9001 &
     ```
-    
 *   **启动 Node Daemon (在 Node 0-998 上)**:
     ```bash
     # 物理存储预热：创建 Chunk 槽位并赋予权限
@@ -516,7 +512,6 @@ qemu-system-x86_64 \
     sleep 2
     ./wavevm_node_slave 9005 4 16384 0 9001 &
     ```
-    
 *   **配置文件 (`/etc/wavevm/devices.txt`)**:
     ```ini
     # Format:
@@ -536,7 +531,6 @@ qemu-system-x86_64 \
 
     END
     ```
-    
 *   **启动 Node Daemon (在 Node 999 上)**:
     ```bash
     sudo mkdir -p /var/lib/wavevm/chunks
@@ -630,7 +624,6 @@ qemu-system-x86_64 \
       cache = "none"
       aio = "native"
     ```
-    
 *   **启动命令**:
     ```bash
     export WVM_ENV_SOCK_PATH=$(strings /proc/$(pgrep -f wavevm_node_master)/environ | grep WVM_ENV_SOCK_PATH | cut -d= -f2)
@@ -735,13 +728,11 @@ qemu-system-x86_64 \
         ```bash
         insmod wavevm.ko service_port=9000
         ```
-        
     2.  **启动 Sidecar (8000)**：
         ```bash
         # 扁平架构下 Sidecar 通常直连对端，配置可为空或指向自己
         ./wavevm_gateway 8000 127.0.0.1 9000 /dev/null 9001 &
         ```
-        
     3.  **启动 Daemon (9000)**：
         ```bash
         # 配置文件仅需包含 Node 0 (192.168.1.2) 作为种子
@@ -749,18 +740,15 @@ qemu-system-x86_64 \
         export WVM_SHM_FILE="/wavevm_ram_node3"
         ./wavevm_node_master 4096 9000 join.txt 3 9001 9005 &
         ```
-        
         4. **[关键] 等待 2 秒后启动 Slave**：
         ```bash
         ./wavevm_node_slave 9005 64 4096 3 9001 &
         ```
-        
 *   **生效验证**：
     *   **在 Node 0 上**：执行 `dmesg | tail`，应看到：
         ```text
         [WVM] IOCTL_SET_GATEWAY: Update Route ID 3 -> 192.168.1.40:9000
         ```
-        
     *   **原理**：Node 3 的 Gossip 包穿透到 Node 0 的 Daemon，Daemon 通过 IOCTL 告知内核直接向 `192.168.1.40` 发起 RDMA/UDP 通信，绕过 Sidecar 以追求极致性能。
 
 **1.1.2. 减少节点 (Scale In)**
@@ -770,7 +758,6 @@ qemu-system-x86_64 \
         ```bash
         killall wavevm_node_slave wavevm_node_master wavevm_gateway
         ```
-        
 *   **生效原理**：
     *   **Fail-in-place**：邻居节点在 5 秒 (`HEARTBEAT_TIMEOUT_US`) 后判定 Node 3 为 `OFFLINE`。
     *   **内核静默**：内核路由表中保留 Node 3 的 IP 记录，但 Logic Core 不再分配任务，流量自然归零。
@@ -798,7 +785,6 @@ qemu-system-x86_64 \
         echo "ROUTE 0 0 192.168.0.1 9000" > upstream.txt
         ./wavevm_gateway 8000 192.168.0.1 9000 upstream.txt 9001 &
         ```
-        
     2.  **启动 Daemon**：
         ```bash
         # Master 监听 9000，分流给 9005
@@ -807,13 +793,11 @@ qemu-system-x86_64 \
         # Slave 监听 9005，执行计算
         ./wavevm_node_slave 9005 4 16384 10 9001 &
         ```
-        
 *   **生效验证**：
     *   **Pod 0 Gateway (`192.168.0.1`) 日志**：
         ```text
         [Gateway-Auto] Learned New Node: 10 -> 192.168.0.20:9000
         ```
-        
     *   **原理**：Gateway 的自学习机制 (`learn_route`) 自动捕获内网流量建立路由。
 
 **2.1.2. 减少节点 (Scale In)**
@@ -851,7 +835,6 @@ qemu-system-x86_64 \
             python3 deploy/wvm_route_ctl.py 10.0.0.1 9001 $id 192.168.1.2 9000
         done
         ```
-        
 *   **验证**：Core Gateway 日志显示 `[Gateway] Route Added/Updated ...`。流量瞬间切换。
 
 **2.2.3. 减少 Gateway (Scale In Pod / Remove)**
@@ -1093,8 +1076,6 @@ V30.0 默认物理世界是充满敌意的，因此设计了层层递进的恢�
 *   **Prophet (先知)** 的跨维度语义同步；
 
 构建了一个即使在物理环境极度恶劣、规模达到行星级的场景下，依然能保持 90% 以上算力转化率的SSI底座。**这就是人类在软件定义物理法则领域能达到的最高成就。**
-
-@@@@@
 
 ## Repo Files
 
@@ -1805,7 +1786,6 @@ void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id);
 
 #endif // LOGIC_CORE_H
 ```
-
 **文件**: `master_core/logic_core.c`
 
 ```c
@@ -12742,7 +12722,7 @@ void flush_all_buffers(void);
 
 #include "aggregator.h"
 #include "../common_include/wavevm_protocol.h"
-#include "../slave_daemon/uthash.h"
+#include "uthash.h"
 
 #if defined(__x86_64__) || defined(__i386__)
   #define CPU_RELAX() __asm__ volatile("pause" ::: "memory")
