@@ -37,6 +37,8 @@ if [[ ! -e /dev/wavevm ]]; then
   echo "[ERROR] /dev/wavevm not found after insmod"
   exit 1
 fi
+sudo chmod 666 /dev/wavevm
+echo "[INFO] /dev/wavevm perms: $(ls -l /dev/wavevm)"
 
 SWARM_CFG="${TMPD}/swarm_modea.conf"
 cat > "${SWARM_CFG}" <<'EOF'
