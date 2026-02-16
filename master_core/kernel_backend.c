@@ -47,6 +47,7 @@
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
 #include <linux/cpu.h>
+#include <linux/version.h>
 
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_protocol.h"
@@ -1374,7 +1375,11 @@ static const struct vm_operations_struct wvm_vm_ops = {
 
 static int wvm_mmap(struct file *filp, struct vm_area_struct *vma) {
     vma->vm_ops = &wvm_vm_ops;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+#else
     vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+#endif
     down_write(&g_mapping_sem);
     g_mapping = vma->vm_file->f_mapping; 
     up_write(&g_mapping_sem);

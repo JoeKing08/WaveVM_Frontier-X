@@ -46,14 +46,14 @@ EOF
 echo "[INFO] starting Mode A slave..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_SHM_FILE=/dev/shm/wvm_modea_slave ./slave_daemon/wavevm_node_slave 29105 1 1024 0 29101
+  WVM_SHM_FILE=/wvm_modea_slave ./slave_daemon/wavevm_node_slave 29105 1 1024 0 29101
 ) > "${TMPD}/slave.log" 2>&1 &
 SLAVE_PID=$!
 
 echo "[INFO] starting Mode A master..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_INSTANCE_ID=modea WVM_SHM_FILE=/dev/shm/wvm_modea_master \
+  WVM_INSTANCE_ID=modea WVM_SHM_FILE=/wvm_modea_master \
     ./master_core/wavevm_node_master 1024 29100 "${SWARM_CFG}" 0 29101 29105 1
 ) > "${TMPD}/master.log" 2>&1 &
 MASTER_PID=$!

@@ -27,25 +27,25 @@ EOF
 echo "[INFO] starting two slave instances..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_SHM_FILE=/dev/shm/wvm_slave_ci_1 ./slave_daemon/wavevm_node_slave 19105 1 1024 0 19101
+  WVM_SHM_FILE=/wvm_slave_ci_1 ./slave_daemon/wavevm_node_slave 19105 1 1024 0 19101
 ) > "${TMPD}/slave1.log" 2>&1 &
 S1_PID=$!
 (
   cd "${ROOT_DIR}" && \
-  WVM_SHM_FILE=/dev/shm/wvm_slave_ci_2 ./slave_daemon/wavevm_node_slave 19205 1 1024 1 19201
+  WVM_SHM_FILE=/wvm_slave_ci_2 ./slave_daemon/wavevm_node_slave 19205 1 1024 1 19201
 ) > "${TMPD}/slave2.log" 2>&1 &
 S2_PID=$!
 
 echo "[INFO] starting two master instances..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_INSTANCE_ID=1 WVM_SHM_FILE=/dev/shm/wvm_master_ci_1 \
+  WVM_INSTANCE_ID=1 WVM_SHM_FILE=/wvm_master_ci_1 \
     ./master_core/wavevm_node_master 1024 19100 "${SWARM_CFG}" 0 19101 19105 1
 ) > "${TMPD}/master1.log" 2>&1 &
 M1_PID=$!
 (
   cd "${ROOT_DIR}" && \
-  WVM_INSTANCE_ID=2 WVM_SHM_FILE=/dev/shm/wvm_master_ci_2 \
+  WVM_INSTANCE_ID=2 WVM_SHM_FILE=/wvm_master_ci_2 \
     ./master_core/wavevm_node_master 1024 19200 "${SWARM_CFG}" 1 19201 19205 1
 ) > "${TMPD}/master2.log" 2>&1 &
 M2_PID=$!
