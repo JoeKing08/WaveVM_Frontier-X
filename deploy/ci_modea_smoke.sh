@@ -32,6 +32,12 @@ warn() {
   echo "[WARN] ${reason}"
 }
 
+if command -v stdbuf >/dev/null 2>&1; then
+  LINEBUF=(stdbuf -oL -eL)
+else
+  LINEBUF=()
+fi
+
 cleanup() {
   local rc=$?
   set +e
@@ -86,15 +92,16 @@ EOF
 echo "[INFO] starting Mode A slave..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_SHM_FILE=/wvm_modea_slave exec ./slave_daemon/wavevm_node_slave 29105 1 1024 0 29101
+  exec env WVM_SHM_FILE=/wvm_modea_slave \
+    "${LINEBUF[@]}" ./slave_daemon/wavevm_node_slave 29105 1 1024 0 29101
 ) > "${TMPD}/slave.log" 2>&1 &
 SLAVE_PID=$!
 
 echo "[INFO] starting Mode A master..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_INSTANCE_ID=modea WVM_SHM_FILE=/wvm_modea_master exec \
-    ./master_core/wavevm_node_master 1024 29100 "${SWARM_CFG}" 0 29101 29105 1
+  exec env WVM_INSTANCE_ID=modea WVM_SHM_FILE=/wvm_modea_master \
+    "${LINEBUF[@]}" ./master_core/wavevm_node_master 1024 29100 "${SWARM_CFG}" 0 29101 29105 1
 ) > "${TMPD}/master.log" 2>&1 &
 MASTER_PID=$!
 

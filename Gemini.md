@@ -13540,3 +13540,31 @@ make -j$(nproc) qemu-system-x86_64
 - 全新目录验证：`wavevm-qemu/build-verify`（已清理）
 - 增量验证目录：`wavevm-qemu/build`
 - 最终版本输出：`QEMU emulator version 5.2.0`
+
+---
+
+## 🧪 2026-02-17 单机 KVM 冒烟修复记录（6C/26G 实例）
+
+背景：
+- 在公网实例上复测时，`deploy/ci_modea_smoke.sh` 与 `deploy/ci_modeb_multi_smoke.sh` 出现“启动证据缺失”假失败。
+- 实际进程与链路正常，问题根因是日志缓冲导致 `slave*.log` 在短窗口内未及时落盘。
+
+修复：
+- 更新 `deploy/ci_modea_smoke.sh` 与 `deploy/ci_modeb_multi_smoke.sh`：
+  - 增加 `stdbuf -oL -eL` 行缓冲支持（无 `stdbuf` 时自动回退）。
+  - 启动命令统一改为 `exec env ... "${LINEBUF[@]}" ...`，确保：
+    1. 日志实时可见；
+    2. 后台 PID 可被 cleanup 正确回收，避免残留进程。
+
+验证结果：
+- 远端实例环境确认：
+  - `/dev/kvm` 存在；
+  - `kvm-ok` 返回 `KVM acceleration can be used`；
+  - 内核头存在（`/lib/modules/$(uname -r)/build`）。
+- 修复后同机复测：
+  - `Mode B` 冒烟：PASS；
+  - `Mode A` 冒烟：PASS；
+  - 进程回收正常，无残留 `wavevm_node_master/slave`。
+- Ubuntu 最小镜像（22.04 minimal cloud image）KVM 运行验证：
+  - QMP `query-status` 返回 `running=true`；
+  - QMP `query-kvm` 返回 `enabled=true, present=true`。

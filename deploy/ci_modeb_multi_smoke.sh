@@ -33,6 +33,12 @@ warn() {
   echo "[WARN] ${reason}"
 }
 
+if command -v stdbuf >/dev/null 2>&1; then
+  LINEBUF=(stdbuf -oL -eL)
+else
+  LINEBUF=()
+fi
+
 cleanup() {
   local rc=$?
   set +e
@@ -61,26 +67,28 @@ EOF
 echo "[INFO] starting two slave instances..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_SHM_FILE=/wvm_slave_ci_1 exec ./slave_daemon/wavevm_node_slave 19105 1 1024 0 19101
+  exec env WVM_SHM_FILE=/wvm_slave_ci_1 \
+    "${LINEBUF[@]}" ./slave_daemon/wavevm_node_slave 19105 1 1024 0 19101
 ) > "${TMPD}/slave1.log" 2>&1 &
 S1_PID=$!
 (
   cd "${ROOT_DIR}" && \
-  WVM_SHM_FILE=/wvm_slave_ci_2 exec ./slave_daemon/wavevm_node_slave 19205 1 1024 1 19201
+  exec env WVM_SHM_FILE=/wvm_slave_ci_2 \
+    "${LINEBUF[@]}" ./slave_daemon/wavevm_node_slave 19205 1 1024 1 19201
 ) > "${TMPD}/slave2.log" 2>&1 &
 S2_PID=$!
 
 echo "[INFO] starting two master instances..."
 (
   cd "${ROOT_DIR}" && \
-  WVM_INSTANCE_ID=1 WVM_SHM_FILE=/wvm_master_ci_1 exec \
-    ./master_core/wavevm_node_master 1024 19100 "${SWARM_CFG}" 0 19101 19105 1
+  exec env WVM_INSTANCE_ID=1 WVM_SHM_FILE=/wvm_master_ci_1 \
+    "${LINEBUF[@]}" ./master_core/wavevm_node_master 1024 19100 "${SWARM_CFG}" 0 19101 19105 1
 ) > "${TMPD}/master1.log" 2>&1 &
 M1_PID=$!
 (
   cd "${ROOT_DIR}" && \
-  WVM_INSTANCE_ID=2 WVM_SHM_FILE=/wvm_master_ci_2 exec \
-    ./master_core/wavevm_node_master 1024 19200 "${SWARM_CFG}" 1 19201 19205 1
+  exec env WVM_INSTANCE_ID=2 WVM_SHM_FILE=/wvm_master_ci_2 \
+    "${LINEBUF[@]}" ./master_core/wavevm_node_master 1024 19200 "${SWARM_CFG}" 1 19201 19205 1
 ) > "${TMPD}/master2.log" 2>&1 &
 M2_PID=$!
 
