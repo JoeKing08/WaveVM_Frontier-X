@@ -12596,33 +12596,108 @@ static int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_wr
 **文件**: `qemu_patch/virtio-blk.diff`
 
 ```diff
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index bac2d6fa2..98e0b5502 100644
 --- a/hw/block/virtio-blk.c
 +++ b/hw/block/virtio-blk.c
-@@ -20,6 +20,10 @@
+@@ -26,6 +26,8 @@
  #include "hw/virtio/virtio-blk.h"
  #include "dataplane/virtio-blk.h"
  #include "scsi/constants.h"
 +
-+// [WaveVM Hook] 声明外部拦截器
 +extern int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
-+
  #ifdef __linux__
- #include <sys/ioctl.h>
+ # include <scsi/sg.h>
  #endif
-@@ -252,6 +256,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
-         return -1;
-     }
+@@ -672,6 +674,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+                                          req->qiov.size / BDRV_SECTOR_SIZE);
+         }
  
-+    // [WaveVM V31] 尝试分布式存储拦截
-+    // 如果拦截成功(返回0)，则直接返回，不再执行本地 IO
-+    if (wavevm_blk_interceptor(req->out.sector, &req->qiov, (type & VIRTIO_BLK_T_OUT)) == 0) {
-+        return 0;
++        if (wavevm_blk_interceptor(req->sector_num, &req->qiov, is_write) == 0) {
++            virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
++            virtio_blk_free_request(req);
++            return 0;
++        }
++
+         if (!virtio_blk_sect_range_ok(s, req->sector_num, req->qiov.size)) {
+             virtio_blk_req_complete(req, VIRTIO_BLK_S_IOERR);
+             block_acct_invalid(blk_get_stats(s->blk),
+```
+
+**文件**: `qemu_patch/hw-wavevm.diff`
+
+```diff
+diff --git a/hw/meson.build b/hw/meson.build
+index 010de7219..e2cd60b30 100644
+--- a/hw/meson.build
++++ b/hw/meson.build
+@@ -39,6 +39,7 @@ subdir('usb')
+ subdir('vfio')
+ subdir('virtio')
+ subdir('watchdog')
++subdir('wavevm')
+ subdir('xen')
+ subdir('xenpv')
+ 
+diff --git a/hw/wavevm/meson.build b/hw/wavevm/meson.build
+new file mode 100644
+index 000000000..1494f023f
+--- /dev/null
++++ b/hw/wavevm/meson.build
+@@ -0,0 +1,3 @@
++softmmu_ss.add(files(
++  'wavevm-block-hook.c',
++))
+diff --git a/hw/wavevm/wavevm-block-hook.c b/hw/wavevm/wavevm-block-hook.c
+new file mode 100644
+index 000000000..b2af780be
+--- /dev/null
++++ b/hw/wavevm/wavevm-block-hook.c
+@@ -0,0 +1,44 @@
++#include "qemu/osdep.h"
++#include "qemu/iov.h"
++
++/*
++ * virtio-blk hook entry point. Returns 0 when the request is handled by the
++ * WaveVM IPC path. Returns -1 to let virtio-blk use its normal local path.
++ */
++int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
++
++extern int wvm_send_ipc_block_io(uint64_t lba, void *buf, uint32_t len, int is_write)
++    __attribute__((weak));
++
++int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write)
++{
++    size_t total_len = qiov->size;
++    uint8_t *linear_buf;
++    int ret;
++
++    if (total_len == 0 || total_len > UINT32_MAX) {
++        return -1;
 +    }
 +
-     if (is_write && type == VIRTIO_BLK_T_FLUSH) {
-         virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
-         return 0;
-
++    linear_buf = g_malloc(total_len);
++    if (!linear_buf) {
++        return -1;
++    }
++
++    if (is_write) {
++        qemu_iovec_to_buf(qiov, 0, linear_buf, total_len);
++    }
++
++    if (!wvm_send_ipc_block_io) {
++        g_free(linear_buf);
++        return -1;
++    }
++
++    ret = wvm_send_ipc_block_io(sector, linear_buf, (uint32_t)total_len, is_write);
++    if (!is_write && ret == 0) {
++        qemu_iovec_from_buf(qiov, 0, linear_buf, total_len);
++    }
++
++    g_free(linear_buf);
++    return ret;
++}
 ```
 
 ---
@@ -13458,113 +13533,6 @@ patch -p1 < ../qemu_patch/hw-wavevm.diff
 ./configure --target-list=x86_64-softmmu --enable-kvm --enable-debug
 make -j$(nproc) qemu-system-x86_64
 ./qemu-system-x86_64 --version
-```
-
-### qemu_patch/virtio-blk.diff
-
-```diff
-diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
-index bac2d6fa2..98e0b5502 100644
---- a/hw/block/virtio-blk.c
-+++ b/hw/block/virtio-blk.c
-@@ -26,6 +26,8 @@
- #include "hw/virtio/virtio-blk.h"
- #include "dataplane/virtio-blk.h"
- #include "scsi/constants.h"
-+
-+extern int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
- #ifdef __linux__
- # include <scsi/sg.h>
- #endif
-@@ -672,6 +674,12 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
-                                          req->qiov.size / BDRV_SECTOR_SIZE);
-         }
- 
-+        if (wavevm_blk_interceptor(req->sector_num, &req->qiov, is_write) == 0) {
-+            virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
-+            virtio_blk_free_request(req);
-+            return 0;
-+        }
-+
-         if (!virtio_blk_sect_range_ok(s, req->sector_num, req->qiov.size)) {
-             virtio_blk_req_complete(req, VIRTIO_BLK_S_IOERR);
-             block_acct_invalid(blk_get_stats(s->blk),
-```
-
-### qemu_patch/hw-wavevm.diff
-
-```diff
-diff --git a/hw/meson.build b/hw/meson.build
-index 010de7219..e2cd60b30 100644
---- a/hw/meson.build
-+++ b/hw/meson.build
-@@ -39,6 +39,7 @@ subdir('usb')
- subdir('vfio')
- subdir('virtio')
- subdir('watchdog')
-+subdir('wavevm')
- subdir('xen')
- subdir('xenpv')
- 
-diff --git a/hw/wavevm/meson.build b/hw/wavevm/meson.build
-new file mode 100644
-index 000000000..1494f023f
---- /dev/null
-+++ b/hw/wavevm/meson.build
-@@ -0,0 +1,3 @@
-+softmmu_ss.add(files(
-+  'wavevm-block-hook.c',
-+))
-diff --git a/hw/wavevm/wavevm-block-hook.c b/hw/wavevm/wavevm-block-hook.c
-new file mode 100644
-index 000000000..b2af780be
---- /dev/null
-+++ b/hw/wavevm/wavevm-block-hook.c
-@@ -0,0 +1,44 @@
-+#include "qemu/osdep.h"
-+#include "qemu/iov.h"
-+
-+/*
-+ * virtio-blk hook entry point. Returns 0 when the request is handled by the
-+ * WaveVM IPC path. Returns -1 to let virtio-blk use its normal local path.
-+ */
-+int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
-+
-+extern int wvm_send_ipc_block_io(uint64_t lba, void *buf, uint32_t len, int is_write)
-+    __attribute__((weak));
-+
-+int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write)
-+{
-+    size_t total_len = qiov->size;
-+    uint8_t *linear_buf;
-+    int ret;
-+
-+    if (total_len == 0 || total_len > UINT32_MAX) {
-+        return -1;
-+    }
-+
-+    linear_buf = g_malloc(total_len);
-+    if (!linear_buf) {
-+        return -1;
-+    }
-+
-+    if (is_write) {
-+        qemu_iovec_to_buf(qiov, 0, linear_buf, total_len);
-+    }
-+
-+    if (!wvm_send_ipc_block_io) {
-+        g_free(linear_buf);
-+        return -1;
-+    }
-+
-+    ret = wvm_send_ipc_block_io(sector, linear_buf, (uint32_t)total_len, is_write);
-+    if (!is_write && ret == 0) {
-+        qemu_iovec_from_buf(qiov, 0, linear_buf, total_len);
-+    }
-+
-+    g_free(linear_buf);
-+    return ret;
-+}
 ```
 
 ### 本次实机验证结果（2026-02-16）
