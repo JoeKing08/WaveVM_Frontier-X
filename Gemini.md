@@ -736,7 +736,7 @@ qemu-system-x86_64 \
     3.  **启动 Daemon (9000)**：
         ```bash
         # 配置文件仅需包含 Node 0 (192.168.1.2) 作为种子
-        echo "NODE 0 192.168.1.2 9000 4 4" > join.txt
+        echo "NODE 0 192.168.1.2 8000 4 4" > join.txt
         export WVM_SHM_FILE="/wavevm_ram_node3"
         ./wavevm_node_master 4096 9000 join.txt 3 9001 9005 &
         ```
@@ -747,9 +747,9 @@ qemu-system-x86_64 \
 *   **生效验证**：
     *   **在 Node 0 上**：执行 `dmesg | tail`，应看到：
         ```text
-        [WVM] IOCTL_SET_GATEWAY: Update Route ID 3 -> 192.168.1.40:9000
+        [WVM] IOCTL_SET_GATEWAY: Update Route ID 3 -> 192.168.1.40:8000
         ```
-    *   **原理**：Node 3 的 Gossip 包穿透到 Node 0 的 Daemon，Daemon 通过 IOCTL 告知内核直接向 `192.168.1.40` 发起 RDMA/UDP 通信，绕过 Sidecar 以追求极致性能。
+    *   **原理**：Node 3 的 Gossip 包穿透到 Node 0 的 Daemon，Daemon 通过 IOCTL 告知内核将 Node 3 的目标地址更新为其 Sidecar（`192.168.1.40:8000`），由 Sidecar 统一转发到本机 Master Ingress（9000）。
 
 **1.1.2. 减少节点 (Scale In)**
 
@@ -764,7 +764,7 @@ qemu-system-x86_64 \
 
 ##### 1.2. Mode B (用户态) 运行模式
 
-*   **增节点**：同 Mode A，但无需 `insmod`。`u_set_gateway_ip` 会更新 Daemon 内存中的路由表，发往 Node 3 的包通过 Socket 直达。
+*   **增节点**：同 Mode A，但无需 `insmod`。`u_set_gateway_ip` 会更新 Daemon 内存中的路由表，发往 Node 3 的包先到其 Sidecar（8000），再由 Sidecar 转发到 Master Ingress（9000）。
 *   **减节点**：Daemon 的 `smart_backoff` 机制会处理节点下线瞬间的 Socket 错误，直到 Logic Core 完成哈希环重构。
 
 ---
@@ -796,7 +796,7 @@ qemu-system-x86_64 \
 *   **生效验证**：
     *   **Pod 0 Gateway (`192.168.0.1`) 日志**：
         ```text
-        [Gateway-Auto] Learned New Node: 10 -> 192.168.0.20:9000
+        [Gateway-Auto] Learned New Node: 10 -> 192.168.0.20:8000
         ```
     *   **原理**：Gateway 的自学习机制 (`learn_route`) 自动捕获内网流量建立路由。
 
