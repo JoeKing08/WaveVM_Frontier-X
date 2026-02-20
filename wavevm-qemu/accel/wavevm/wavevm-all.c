@@ -39,7 +39,69 @@ extern void wvm_register_volatile_ram(uint64_t gpa, uint64_t size);
 extern void wvm_apply_remote_push(uint16_t msg_type, void *payload);
 extern void wavevm_start_vcpu_thread(CPUState *cpu);
 
-int g_wvm_local_split = 4;
+int g_wvm_local_split = 0;
+static bool g_wvm_split_explicit = false;
+
+static int wavevm_auto_split_from_vcpus(int vcpus)
+{
+    if (vcpus <= 1) {
+        return 1;
+    }
+    if (vcpus == 2) {
+        return 1;
+    }
+    return vcpus / 2;
+}
+
+static void wavevm_resolve_split(MachineState *ms)
+{
+    int vcpus = 1;
+    const char *env_split;
+
+    if (ms && ms->smp.cpus > 0) {
+        vcpus = ms->smp.cpus;
+    }
+
+    if (!g_wvm_split_explicit) {
+        env_split = getenv("WVM_LOCAL_SPLIT");
+        if (env_split && *env_split) {
+            char *endptr = NULL;
+            long parsed = strtol(env_split, &endptr, 10);
+            if (endptr && *endptr == '\0' && parsed >= 0) {
+                g_wvm_local_split = (int)parsed;
+            } else {
+                g_wvm_local_split = wavevm_auto_split_from_vcpus(vcpus);
+            }
+        } else {
+            g_wvm_local_split = wavevm_auto_split_from_vcpus(vcpus);
+        }
+    }
+
+    if (g_wvm_local_split < 0) {
+        g_wvm_local_split = 0;
+    }
+    if (g_wvm_local_split > vcpus) {
+        g_wvm_local_split = vcpus;
+    }
+}
+
+void wavevm_apply_split_hint(int split)
+{
+    int vcpus = 1;
+
+    if (g_wvm_split_explicit || split < 0) {
+        return;
+    }
+
+    if (current_machine && current_machine->smp.cpus > 0) {
+        vcpus = current_machine->smp.cpus;
+    }
+
+    g_wvm_local_split = split;
+    if (g_wvm_local_split > vcpus) {
+        g_wvm_local_split = vcpus;
+    }
+}
 
 /* [V28 FIX] 坚如磐石的读取函数，处理 Partial Read 和 EINTR */
 static int read_exact(int fd, void *buf, size_t len) {
@@ -508,6 +570,8 @@ static int wavevm_init_machine(MachineState *ms) {
 
     int ret = 0;
 
+    wavevm_resolve_split(ms);
+
     memory_listener_register(&wavevm_mem_listener, &address_space_memory);
 
     if (s->mode == WVM_MODE_KERNEL) {
@@ -563,6 +627,7 @@ static void wavevm_set_mode(Object *obj, const char *value, Error **errp)
 static void wavevm_set_split(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
     uint32_t value; if (!visit_type_uint32(v, name, &value, errp)) return;
     g_wvm_local_split = value;
+    g_wvm_split_explicit = true;
 }
 static void wavevm_get_split(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
     uint32_t value = g_wvm_local_split; visit_type_uint32(v, name, &value, errp);

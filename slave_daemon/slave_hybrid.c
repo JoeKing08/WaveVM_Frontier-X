@@ -774,7 +774,7 @@ void* kvm_worker_thread(void *arg) {
                 local_req.mode_tcg = h->mode_tcg; 
                 // slave_id 和 vcpu_index 在 stateless 模式下通常由调度器指定
                 // 这里我们直接透传包头里的 source id 作为请求方
-                local_req.slave_id = ntohl(h->slave_id); 
+                local_req.slave_id = h->slave_id; 
 
                 // 2. 从 Payload 提取 Context
                 // 指针 arithmetic: bufs[i] 是包头起始，+sizeof(*h) 是 payload 起始

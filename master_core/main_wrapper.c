@@ -434,6 +434,7 @@ int main(int argc, char **argv) {
     // 我们需要再次扫描配置文件，找到 my_phys_id 对应的 Virtual ID (vnode_start)
     // 同时检查启动参数申请的 RAM 是否满足配置文件的要求
     int my_virtual_id = -1;
+    int my_local_cores = 1;
     
     FILE *fp_check = fopen(config_file, "r");
     if (fp_check) {
@@ -466,6 +467,8 @@ int main(int argc, char **argv) {
                 if (current_phys_idx == my_phys_id) {
                     // A. 身份确认
                     my_virtual_id = current_v_id_accumulator;
+                    if (cores < 1) cores = 1;
+                    my_local_cores = cores;
                     
                     // B. [红队防御] 资源自检：防止配置撒谎导致 Crash
                     size_t config_bytes = (size_t)ram_gb * 1024 * 1024 * 1024;
@@ -496,6 +499,11 @@ int main(int argc, char **argv) {
     // Logic Core 将根据此 ID 判断是否拥有某个 GPA 的管理权 (Directory Owner)
     wvm_set_my_node_id(my_virtual_id);
     printf("[Init] Identity Mapped: PhysID %d -> VirtualID %d (Primary)\n", my_phys_id, my_virtual_id);
+    {
+        char split_buf[32];
+        snprintf(split_buf, sizeof(split_buf), "%d", my_local_cores);
+        setenv("WVM_LOCAL_SPLIT", split_buf, 1);
+    }
 
     // 8. 初始化共享内存 (RAM Backing Store)
     // 优先读取环境变量，支持单机多实例测试

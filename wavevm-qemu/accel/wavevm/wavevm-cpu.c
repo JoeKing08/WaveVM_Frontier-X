@@ -20,11 +20,67 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
+#include <limits.h>
+
+extern void wavevm_apply_split_hint(int split);
 
 // Per-vCPU Socket Pool to eliminate lock contention
 static int *g_vcpu_socks = NULL;
 static int g_configured_vcpus = 0;
 static int g_wvm_debug_once = 0;
+
+static void wavevm_try_import_split_from_peer(int sock)
+{
+#ifdef SO_PEERCRED
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    char path[64];
+    FILE *fp;
+    char envbuf[8192];
+    size_t n;
+    size_t i = 0;
+
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0) {
+        return;
+    }
+
+    snprintf(path, sizeof(path), "/proc/%ld/environ", (long)cred.pid);
+    fp = fopen(path, "rb");
+    if (!fp) {
+        return;
+    }
+
+    n = fread(envbuf, 1, sizeof(envbuf) - 1, fp);
+    fclose(fp);
+    if (n == 0) {
+        return;
+    }
+    envbuf[n] = '\0';
+
+    while (i < n) {
+        char *kv = &envbuf[i];
+        size_t kv_len = strnlen(kv, n - i);
+
+        if (kv_len == 0) {
+            i++;
+            continue;
+        }
+
+        if (strncmp(kv, "WVM_LOCAL_SPLIT=", 16) == 0) {
+            char *endptr = NULL;
+            long parsed = strtol(kv + 16, &endptr, 10);
+            if (endptr && *endptr == '\0' && parsed >= 0 && parsed <= INT_MAX) {
+                wavevm_apply_split_hint((int)parsed);
+            }
+            break;
+        }
+
+        i += kv_len + 1;
+    }
+#else
+    (void)sock;
+#endif
+}
 
 static int connect_to_master_helper(void)
 {
@@ -50,7 +106,48 @@ static int connect_to_master_helper(void)
         close(sock);
         return -1;
     }
+    wavevm_try_import_split_from_peer(sock);
     return sock;
+}
+
+static int write_full(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int read_full(int fd, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = read(fd, p + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
 }
 
 // TCG Helper Declarations (Defined in wavevm-tcg.c)
@@ -151,6 +248,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
         memset(&req, 0, sizeof(req));
         
         req.slave_id = wavevm_pick_target_slave(cpu);
+        req.vcpu_index = cpu->cpu_index;
 
         // 2. 序列化 CPU 状态
         if (kvm_enabled()) {
@@ -251,20 +349,16 @@ static void wavevm_remote_exec(CPUState *cpu) {
     }
 
     // 准备发送缓冲区
-    uint8_t buf[16384]; //需要调大一点点
-    struct wvm_header *hdr = (struct wvm_header *)buf;
-    struct wvm_ipc_cpu_run_req *req = (struct wvm_ipc_cpu_run_req *)(buf + sizeof(struct wvm_header));
-    req->slave_id = wavevm_pick_target_slave(cpu);
-    req->vcpu_index = cpu->cpu_index;
-    
-    uint32_t target_slave = wavevm_pick_target_slave(cpu);
+    struct wvm_ipc_header_t ipc_hdr = {
+        .type = WVM_IPC_TYPE_CPU_RUN,
+        .len = sizeof(struct wvm_ipc_cpu_run_req),
+    };
+    struct wvm_ipc_cpu_run_req req;
+    struct wvm_ipc_cpu_run_ack ack;
+    memset(&req, 0, sizeof(req));
 
-    hdr->magic = WVM_MAGIC;
-    hdr->msg_type = MSG_VCPU_RUN;
-    hdr->slave_id = target_slave;
-    // 使用全1作为异步标记，避开 GPA 0
-    hdr->req_id = WVM_HTONLL(~0ULL);
-    hdr->flags = 0;
+    req.slave_id = wavevm_pick_target_slave(cpu);
+    req.vcpu_index = cpu->cpu_index;
 
     // 1. 序列化 CPU 状态 (Serialization)
     if (kvm_enabled()) {
@@ -274,10 +368,9 @@ static void wavevm_remote_exec(CPUState *cpu) {
         ioctl(cpu->kvm_fd, KVM_GET_REGS, &kregs);
         ioctl(cpu->kvm_fd, KVM_GET_SREGS, &ksregs);
 
-        hdr->mode_tcg = 0;
-        hdr->payload_len = sizeof(wvm_kvm_context_t);
+        req.mode_tcg = 0;
         
-        wvm_kvm_context_t *kctx = &req->ctx.kvm;
+        wvm_kvm_context_t *kctx = &req.ctx.kvm;
         kctx->rax = kregs.rax; kctx->rbx = kregs.rbx; kctx->rcx = kregs.rcx;
         kctx->rdx = kregs.rdx; kctx->rsi = kregs.rsi; kctx->rdi = kregs.rdi;
         kctx->rsp = kregs.rsp; kctx->rbp = kregs.rbp;
@@ -287,33 +380,33 @@ static void wavevm_remote_exec(CPUState *cpu) {
         kctx->rip = kregs.rip; kctx->rflags = kregs.rflags;
         memcpy(kctx->sregs_data, &ksregs, sizeof(ksregs));
     } else {
-        hdr->mode_tcg = 1;
-        hdr->payload_len = sizeof(wvm_tcg_context_t);
-        wvm_tcg_get_state(cpu, &req->ctx.tcg);
+        req.mode_tcg = 1;
+        wvm_tcg_get_state(cpu, &req.ctx.tcg);
     }
 
-    // 2. 网络发送 (Lock-Free)
-    size_t packet_len = sizeof(struct wvm_header) + hdr->payload_len;
-    // [V25.4 REMOVED] qemu_mutex_lock(&s->ipc_lock);
-    if (write(vcpu_sock, buf, packet_len) != packet_len) {
-        // Log error or handle reconnect
+    // 2. IPC 发送 (wvm_ipc_header + wvm_ipc_cpu_run_req)
+    if (write_full(vcpu_sock, &ipc_hdr, sizeof(ipc_hdr)) < 0) {
+        return;
+    }
+    if (write_full(vcpu_sock, &req, sizeof(req)) < 0) {
         return;
     }
 
-    // 3. 网络接收 (阻塞本线程，不影响其他 vCPU)
-    ssize_t len = read(vcpu_sock, buf, sizeof(buf));
-    
-    if (len < sizeof(struct wvm_header)) return;
-    
-    // 4. 反序列化 CPU 状态
-    struct wvm_ipc_cpu_run_ack *ack = (struct wvm_ipc_cpu_run_ack *)(buf + sizeof(struct wvm_header));
+    // 3. IPC 接收 ACK (阻塞本线程，不影响其他 vCPU)
+    if (read_full(vcpu_sock, &ack, sizeof(ack)) < 0) {
+        return;
+    }
+    if (ack.status < 0) {
+        return;
+    }
 
-    if (ack->mode_tcg) {
-        wvm_tcg_set_state(cpu, &ack->ctx.tcg);
+    // 4. 反序列化 CPU 状态
+    if (ack.mode_tcg) {
+        wvm_tcg_set_state(cpu, &ack.ctx.tcg);
     } else {
         struct kvm_regs kregs;
         struct kvm_sregs ksregs;
-        wvm_kvm_context_t *kctx = &ack->ctx.kvm;
+        wvm_kvm_context_t *kctx = &ack.ctx.kvm;
 
         kregs.rax = kctx->rax; kregs.rbx = kctx->rbx; kregs.rcx = kctx->rcx; 
         kregs.rdx = kctx->rdx; kregs.rsi = kctx->rsi; kregs.rdi = kctx->rdi;

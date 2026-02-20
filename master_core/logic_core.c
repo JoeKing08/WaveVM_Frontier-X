@@ -212,7 +212,7 @@ uint32_t wvm_get_compute_slave_id(int vcpu_index) {
     if (vcpu_index >= 0 && vcpu_index < WVM_CPU_ROUTE_TABLE_SIZE) {
         return g_cpu_route_table[vcpu_index];
     }
-    return 0; 
+    return WVM_NODE_AUTO_ROUTE; 
 }
 
 /* 
@@ -666,6 +666,9 @@ int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint) {
     pthread_rwlock_init(&g_ring_lock, NULL);
     
     // 分片广播队列在定义处进行静态零初始化；此处不重复初始化。
+    for (int i = 0; i < WVM_CPU_ROUTE_TABLE_SIZE; i++) {
+        g_cpu_route_table[i] = WVM_NODE_AUTO_ROUTE;
+    }
     
     g_total_nodes = (total_nodes_hint > 0) ? total_nodes_hint : 1;
     return 0;
@@ -1114,12 +1117,16 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
     }
 
     struct wvm_header *hdr = (struct wvm_header *)buffer;
+    memset(hdr, 0, sizeof(*hdr));
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(msg_type);
     hdr->payload_len = htons(len);
     hdr->slave_id = htonl(g_my_node_id); // Source ID
     hdr->req_id = WVM_HTONLL(rid);
     hdr->qos_level = 1; // Control messages are fast lane
+    if (msg_type == MSG_VCPU_RUN) {
+        hdr->mode_tcg = (len == (int)sizeof(wvm_tcg_context_t)) ? 1 : 0;
+    }
     
     if (payload && len > 0) {
         memcpy(buffer + sizeof(*hdr), payload, len);

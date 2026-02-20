@@ -1305,12 +1305,11 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         uint32_t target = req.slave_id;
         if (target == WVM_NODE_AUTO_ROUTE) {
             target = wvm_get_compute_slave_id(req.vcpu_index);
-            if (target == WVM_NODE_AUTO_ROUTE) {
-                target = 0;
-            }
         }
+        if (target == WVM_NODE_AUTO_ROUTE || target >= WVM_MAX_GATEWAYS) return -ENODEV;
 
-        int ret = wvm_rpc_call(MSG_VCPU_RUN, &req.ctx, sizeof(req.ctx), target, &ack.ctx, sizeof(ack.ctx));
+        int ctx_len = req.mode_tcg ? sizeof(req.ctx.tcg) : sizeof(req.ctx.kvm);
+        int ret = wvm_rpc_call(MSG_VCPU_RUN, &req.ctx, ctx_len, target, &ack.ctx, sizeof(ack.ctx));
         ack.status = ret;
         ack.mode_tcg = req.mode_tcg;
         if (copy_to_user(argp, &ack, sizeof(ack))) return -EFAULT;
@@ -1368,9 +1367,27 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         break;
     }
 
-    // 保留 CPU 接口防止旧工具报错，虽 V29 暂不使用静态 CPU 绑定，但加上空实现更安全
-    case IOCTL_UPDATE_CPU_ROUTE:
+    case IOCTL_UPDATE_CPU_ROUTE: {
+        struct wvm_ioctl_route_update head;
+        if (copy_from_user(&head, argp, sizeof(head))) return -EFAULT;
+        if (head.count > 4096 || head.start_index >= 4096) return -EINVAL;
+        if (head.start_index + head.count > 4096) return -EINVAL;
+
+        size_t bytes = (size_t)head.count * sizeof(uint32_t);
+        if (head.count != 0 && bytes / sizeof(uint32_t) != head.count) return -EINVAL;
+        uint32_t *buf = vmalloc(bytes);
+        if (!buf) return -ENOMEM;
+        if (copy_from_user(buf, (uint8_t *)argp + sizeof(head), head.count * sizeof(uint32_t))) {
+            vfree(buf);
+            return -EFAULT;
+        }
+
+        for (uint32_t i = 0; i < head.count; i++) {
+            wvm_set_cpu_mapping((int)(head.start_index + i), buf[i]);
+        }
+        vfree(buf);
         break;
+    }
 
     default: return -EINVAL;
     }
