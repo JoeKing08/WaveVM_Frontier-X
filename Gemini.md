@@ -13597,3 +13597,127 @@ make -j$(nproc) qemu-system-x86_64
 - Ubuntu 最小镜像（22.04 minimal cloud image）KVM 运行验证：
   - QMP `query-status` 返回 `running=true`；
   - QMP `query-kvm` 返回 `enabled=true, present=true`。
+
+---
+
+## 🧪 2026-02-20 双节点云实例专项验证记录（Flat 集群，排除分布式存储）
+
+背景：
+- 本次验证目标是“在不扩大代码改动范围的前提下”，复核双节点公网实例上的真实运行状态。
+- 用户要求优先验证：
+  1. 双节点部署可持续运行；
+  2. Guest 可真实启动并执行命令；
+  3. 在“先排除分布式存储功能”的条件下，尽可能确认分布式双机算力链路是否可用。
+
+### 1. 实例与拓扑
+
+- 时间：2026-02-20（BJT）
+- 节点：2 台 Ubuntu 22.04 最小化实例
+- 角色：
+  - NodeA（主测节点）：`gateway + master + slave`，并承担 QEMU 启动
+  - NodeB（协同节点）：`gateway + master + slave`
+- 拓扑文件（两端一致）：
+  - `NODE 0 172.30.0.114 8000 4 4`
+  - `NODE 1 172.30.0.104 8000 4 4`
+  - `ROUTE 0 1 172.30.0.114 9000`
+  - `ROUTE 1 1 172.30.0.104 9000`
+
+### 2. 代码与构建状态
+
+- 本轮在远端完成过多次增量构建，`qemu-system-x86_64` 可正常编译产出。
+- `-accel help` 可见 `wavevm` 项，说明编译图中 WaveVM 加速器已生效。
+- 为追踪启动崩溃路径，本轮对 `wavevm-qemu` 相关文件进行了最小化兼容修补与重编译（均在当前仓库改动中可见）。
+
+#### 2.1 本轮“必要”代码变更清单（与本次验证直接相关）
+
+- 构建图补齐（必要）：
+  - `wavevm-qemu/accel/meson.build`
+  - `wavevm-qemu/accel/wavevm/meson.build`（新增）
+  - 作用：确保 `accel/wavevm` 被 QEMU 构建系统纳入并参与链接。
+- 运行时兼容修补（必要）：
+  - `wavevm-qemu/accel/wavevm/wavevm-all.c`
+  - `wavevm-qemu/accel/wavevm/wavevm-cpu.c`
+  - `wavevm-qemu/accel/wavevm/wavevm-tcg.c`
+  - `wavevm-qemu/accel/wavevm/wavevm-user-mem.c`
+  - `wavevm-qemu/hw/wavevm/wavevm-mem.c`
+  - `master_core/kernel_backend.c`
+  - 作用：对齐 QEMU 5.2 API、修正路由与内存同步路径中的兼容问题，降低启动期崩溃与错误退出概率。
+- 启动路径保护（必要但仍未完全闭环）：
+  - `wavevm-qemu/hw/acpi/cpu.c`
+  - 作用：为当前 WaveVM 路径增加启动期保护，避免进入已知不稳定分支。
+- 双节点实机脚本（可选辅助）：
+  - `deploy/cloud_flat_2node_smoke.sh`（新增）
+  - 作用：提供云端双节点扁平集群一键化冒烟入口；不影响核心功能逻辑。
+
+说明：
+- 上述为“本次验证直接使用或依赖”的必要改动。
+- 临时探针（`/tmp/wvm_remote_run_probe*`）仅用于实机排障，不入仓库，不计入正式改动集。
+
+### 3. 双节点守护进程存活性
+
+- NodeA：`wvmA-gw / wvmA-master / wvmA-slave`（tmux）持续存活。
+- NodeB：`wvm-gw / wvm-master / wvm-slave`（tmux）持续存活。
+- 公网到 NodeB 的 8004 端口间歇性超时；通过私网 `172.30.0.104` 可稳定访问并确认进程状态。
+
+### 4. WaveVM Guest 实测结果（关键）
+
+#### 4.1 `mode=kernel`
+
+- 现象：启动即触发断言并退出。
+- 典型报错：
+  - `qemu_mutex_lock_iothread_impl: assertion failed: (!qemu_mutex_iothread_locked())`
+- 结论：当前 `mode=kernel` 在该环境未达可运行状态。
+
+#### 4.2 `mode=user`
+
+- 现象：极早期段错误（`SIGSEGV`），多轮复现。
+- 特征：崩溃点在启动阶段漂移，但可稳定复现“秒崩”。
+- 结论：当前 `mode=user` 在该环境未达可运行状态。
+
+### 5. 按“排除分布式存储”策略的绕行验证
+
+为区分“功能性断裂”和“链路基础能力”，执行了绕行验证：
+
+1. 不走 WaveVM 加速器，改用 `-accel kvm` 启动同镜像 Guest；
+2. 真实进入 Guest（非仅日志判断）；
+3. 在 Guest 内执行 CPU/内存/磁盘基础操作；
+4. 正常关机并确认 VM 退出。
+
+实测：
+- SSH 登录成功（`tester@test123`，`127.0.0.1:2226`）。
+- Guest 内命令成功执行：`uname -a`、`uptime`、`nproc`、`free -m`、`lsblk`、`df -h`、`dd 64MiB + sha256sum`。
+- Guest 关机成功，QEMU 会话正常退出。
+
+解释：
+- 云主机、镜像、基本虚拟化路径（KVM）与测试方法本身有效。
+- 当前失败集中在 WaveVM 运行时链路，而非“实例不可用”或“镜像不可启动”。
+
+### 6. 双机算力链路专项探测（不改仓库代码）
+
+为直接验证“是否打到 NodeB 计算节点”，使用临时探针做了对照测试：
+
+- 在 NodeA 临时编译 `IOCTL_WVM_REMOTE_RUN` 探针（位于 `/tmp`，不入仓库），连续发起 `slave_id=auto-route` 请求。
+- 在 NodeB 抓 `udp 9000/9005` 流量做对照：
+  - 组 A：`vcpu_index=1`
+  - 组 B：`vcpu_index=5`（期望更可能路由到远端）
+
+结果：
+- 探针调用可发出（`ioctl_fail=0`），但 ACK 状态未出现成功。
+- NodeB 抓包显示均为本机回环 `127.0.0.1:9000 -> 127.0.0.1:9000`。
+- 未观察到 `NodeA(172.30.0.114) -> NodeB(172.30.0.104):9000` 的计算包命中。
+
+结论：
+- 在本轮实测条件下，“双机分布式算力已正常可用”这一目标尚未达成。
+- 当前表现更接近“请求未形成有效远端执行闭环”或“路由/执行返回状态异常”。
+
+### 7. 本轮总评
+
+- 已确认：
+  - 双节点守护进程可拉起并维持；
+  - 云实例与 Guest 镜像可正常运行（经 KVM 路径实证）；
+  - 测试链路与验证方法有效。
+- 未确认（仍阻塞）：
+  - WaveVM 加速路径下的稳定 Guest 运行；
+  - 双节点分布式算力闭环成功执行。
+
+> 备注：本记录为本次会话的完整实机归档，重点反映“可运行部分已验证通过、阻塞点已收敛定位、但双机算力目标仍未闭环”的真实状态。

@@ -1301,7 +1301,16 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         struct wvm_ipc_cpu_run_req req;
         struct wvm_ipc_cpu_run_ack ack;
         if (copy_from_user(&req, argp, sizeof(req))) return -EFAULT;
-        int ret = wvm_rpc_call(MSG_VCPU_RUN, &req.ctx, sizeof(req.ctx), req.slave_id, &ack.ctx, sizeof(ack.ctx));
+
+        uint32_t target = req.slave_id;
+        if (target == WVM_NODE_AUTO_ROUTE) {
+            target = wvm_get_compute_slave_id(req.vcpu_index);
+            if (target == WVM_NODE_AUTO_ROUTE) {
+                target = 0;
+            }
+        }
+
+        int ret = wvm_rpc_call(MSG_VCPU_RUN, &req.ctx, sizeof(req.ctx), target, &ack.ctx, sizeof(ack.ctx));
         ack.status = ret;
         ack.mode_tcg = req.mode_tcg;
         if (copy_to_user(argp, &ack, sizeof(ack))) return -EFAULT;

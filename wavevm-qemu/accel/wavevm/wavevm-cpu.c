@@ -2,28 +2,60 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "sysemu/cpus.h"
+#include "sysemu/hw_accel.h"
 #include "sysemu/kvm.h" 
+#include "sysemu/runstate.h"
 #include "linux/kvm.h"
+#include "hw/boards.h"
 #include "qemu/main-loop.h"
 #include "exec/address-spaces.h"
+#include "exec/cpu-all.h"
 #include "../../../common_include/wavevm_protocol.h" 
 #include "../../../common_include/wavevm_config.h"
+#include "../../../common_include/wavevm_ioctl.h"
 #include "wavevm-accel.h"
 #include "qemu/thread.h"
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/ioctl.h>
 
 // Per-vCPU Socket Pool to eliminate lock contention
 static int *g_vcpu_socks = NULL;
 static int g_configured_vcpus = 0;
+static int g_wvm_debug_once = 0;
+
+static int connect_to_master_helper(void)
+{
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    const char *env_path;
+    char fallback[128];
+
+    if (sock < 0) {
+        return -1;
+    }
+
+    env_path = getenv("WVM_ENV_SOCK_PATH");
+    if (!env_path) {
+        const char *inst_id = getenv("WVM_INSTANCE_ID");
+        snprintf(fallback, sizeof(fallback), "/tmp/wvm_user_%s.sock",
+                 inst_id ? inst_id : "0");
+        env_path = fallback;
+    }
+
+    strncpy(addr.sun_path, env_path, sizeof(addr.sun_path) - 1);
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
 
 // TCG Helper Declarations (Defined in wavevm-tcg.c)
 extern void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 extern void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
-
-// 引用 wavevm-all.c 中定义的全局变量
-extern int g_wvm_local_split;
 
 struct wavevm_policy_ops {
     int (*schedule_policy)(int cpu_index);
@@ -37,6 +69,32 @@ static int remote_rpc_policy(int cpu_index) {
 }
 
 static struct wavevm_policy_ops ops = { .schedule_policy = remote_rpc_policy };
+
+static uint32_t wavevm_pick_target_slave(const CPUState *cpu)
+{
+    if (g_wvm_local_split > 0 && cpu->cpu_index >= g_wvm_local_split) {
+        return 1;
+    }
+    return 0;
+}
+
+static bool wavevm_valid_io_exit(const struct kvm_run *run)
+{
+    if (run->io.size != 1 && run->io.size != 2 &&
+        run->io.size != 4 && run->io.size != 8) {
+        return false;
+    }
+    if (run->io.count == 0 || run->io.count > 8) {
+        return false;
+    }
+    return true;
+}
+
+static bool wavevm_valid_mmio_exit(const struct kvm_run *run)
+{
+    return run->mmio.len == 1 || run->mmio.len == 2 ||
+           run->mmio.len == 4 || run->mmio.len == 8;
+}
 
 /* 
  * [物理意图] 充当远程 Slave 的“本地代理执行人”。
@@ -73,6 +131,11 @@ static void wavevm_remote_exec(CPUState *cpu) {
     if (cpu->cpu_index >= g_configured_vcpus) return;
     
     int vcpu_sock = g_vcpu_socks[cpu->cpu_index];
+    if (!g_wvm_debug_once) {
+        g_wvm_debug_once = 1;
+        fprintf(stderr, "[WVM-DBG] cpu=%d kvm_enabled=%d vcpu_sock=%d split=%d\n",
+                cpu->cpu_index, kvm_enabled(), vcpu_sock, g_wvm_local_split);
+    }
     
     // 如果没有 socket (说明是 Kernel Mode), 走 IOCTL 路径
     if (vcpu_sock < 0) { 
@@ -87,7 +150,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
         struct wvm_ipc_cpu_run_ack ack;
         memset(&req, 0, sizeof(req));
         
-        req.slave_id = WVM_NODE_AUTO_ROUTE;
+        req.slave_id = wavevm_pick_target_slave(cpu);
 
         // 2. 序列化 CPU 状态
         if (kvm_enabled()) {
@@ -113,6 +176,8 @@ static void wavevm_remote_exec(CPUState *cpu) {
 
         // 3. 陷入内核 (Trap into Kernel)
         // 这一步会阻塞，直到远程执行完毕并返回结果
+        fprintf(stderr, "[WVM-DBG] kernel path cpu=%d target=%u mode_tcg=%u\n",
+                cpu->cpu_index, req.slave_id, req.mode_tcg);
         int ret = ioctl(s->dev_fd, IOCTL_WVM_REMOTE_RUN, &req);
         
         if (ret < 0) {
@@ -147,26 +212,36 @@ static void wavevm_remote_exec(CPUState *cpu) {
             run->exit_reason = kctx->exit_reason;
 
             if (kctx->exit_reason == KVM_EXIT_IO) {
-                run->io.direction = kctx->exit_info.io.direction;
-                run->io.size      = kctx->exit_info.io.size;
-                run->io.port      = kctx->exit_info.io.port;
-                run->io.count     = kctx->exit_info.io.count;
+                run->io.direction = kctx->io.direction;
+                run->io.size      = kctx->io.size;
+                run->io.port      = kctx->io.port;
+                run->io.count     = kctx->io.count;
                 if (run->io.direction == KVM_EXIT_IO_OUT) {
                     size_t mmap_size = ioctl(cpu->kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-                    if (run->io.data_offset + run->io.size * run->io.count <= cpu->mmap_size) {
+                    if (run->io.data_offset + run->io.size * run->io.count <= mmap_size) {
                         uint8_t *io_ptr = (uint8_t *)run + run->io.data_offset;
-                        memcpy(io_ptr, kctx->exit_info.io.data, run->io.size * run->io.count);
+                        size_t io_bytes = run->io.size * run->io.count;
+                        if (io_bytes > sizeof(kctx->io.data)) {
+                            io_bytes = sizeof(kctx->io.data);
+                        }
+                        memcpy(io_ptr, kctx->io.data, io_bytes);
                     }
+                }
+                if (!wavevm_valid_io_exit(run)) {
+                    return;
                 }
                 qemu_mutex_lock_iothread();
                 wavevm_handle_io(cpu);
                 qemu_mutex_unlock_iothread();
             } 
             else if (kctx->exit_reason == KVM_EXIT_MMIO) {
-                run->mmio.phys_addr = kctx->exit_info.mmio.phys_addr;
-                run->mmio.len       = kctx->exit_info.mmio.len;
-                run->mmio.is_write  = kctx->exit_info.mmio.is_write;
-                memcpy(run->mmio.data, kctx->exit_info.mmio.data, 8);
+                run->mmio.phys_addr = kctx->mmio.phys_addr;
+                run->mmio.len       = kctx->mmio.len;
+                run->mmio.is_write  = kctx->mmio.is_write;
+                memcpy(run->mmio.data, kctx->mmio.data, 8);
+                if (!wavevm_valid_mmio_exit(run)) {
+                    return;
+                }
                 qemu_mutex_lock_iothread();
                 wavevm_handle_mmio(cpu);
                 qemu_mutex_unlock_iothread();
@@ -179,20 +254,17 @@ static void wavevm_remote_exec(CPUState *cpu) {
     uint8_t buf[16384]; //需要调大一点点
     struct wvm_header *hdr = (struct wvm_header *)buf;
     struct wvm_ipc_cpu_run_req *req = (struct wvm_ipc_cpu_run_req *)(buf + sizeof(struct wvm_header));
-    req->slave_id = WVM_NODE_AUTO_ROUTE; 
+    req->slave_id = wavevm_pick_target_slave(cpu);
     req->vcpu_index = cpu->cpu_index;
     
-    uint32_t target_slave = WVM_NODE_AUTO_ROUTE; 
+    uint32_t target_slave = wavevm_pick_target_slave(cpu);
 
     hdr->magic = WVM_MAGIC;
     hdr->msg_type = MSG_VCPU_RUN;
     hdr->slave_id = target_slave;
     // 使用全1作为异步标记，避开 GPA 0
     hdr->req_id = WVM_HTONLL(~0ULL);
-    hdr->is_frag = 0;
-
-    // 将 vCPU ID 埋入 Payload 的冗余字段中，供 Slave 端的 Proxy 负载均衡使用
-    req->slave_id = cpu->cpu_index; 
+    hdr->flags = 0;
 
     // 1. 序列化 CPU 状态 (Serialization)
     if (kvm_enabled()) {
@@ -260,25 +332,35 @@ static void wavevm_remote_exec(CPUState *cpu) {
         run->exit_reason = kctx->exit_reason;
 
         if (kctx->exit_reason == KVM_EXIT_IO) {
-            run->io.direction = kctx->exit_info.io.direction;
-            run->io.size      = kctx->exit_info.io.size;
-            run->io.port      = kctx->exit_info.io.port;
-            run->io.count     = kctx->exit_info.io.count;
+            run->io.direction = kctx->io.direction;
+            run->io.size      = kctx->io.size;
+            run->io.port      = kctx->io.port;
+            run->io.count     = kctx->io.count;
             
             if (run->io.direction == KVM_EXIT_IO_OUT) {
                 size_t mmap_size = ioctl(cpu->kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
                 if (run->io.data_offset + run->io.size * run->io.count <= mmap_size) {
                     uint8_t *io_ptr = (uint8_t *)run + run->io.data_offset;
-                    memcpy(io_ptr, kctx->exit_info.io.data, run->io.size * run->io.count);
+                    size_t io_bytes = run->io.size * run->io.count;
+                    if (io_bytes > sizeof(kctx->io.data)) {
+                        io_bytes = sizeof(kctx->io.data);
+                    }
+                    memcpy(io_ptr, kctx->io.data, io_bytes);
                 }
+            }
+            if (!wavevm_valid_io_exit(run)) {
+                return;
             }
             wavevm_handle_io(cpu);
         } 
         else if (kctx->exit_reason == KVM_EXIT_MMIO) {
-            run->mmio.phys_addr = kctx->exit_info.mmio.phys_addr;
-            run->mmio.len       = kctx->exit_info.mmio.len;
-            run->mmio.is_write  = kctx->exit_info.mmio.is_write;
-            memcpy(run->mmio.data, kctx->exit_info.mmio.data, 8);
+            run->mmio.phys_addr = kctx->mmio.phys_addr;
+            run->mmio.len       = kctx->mmio.len;
+            run->mmio.is_write  = kctx->mmio.is_write;
+            memcpy(run->mmio.data, kctx->mmio.data, 8);
+            if (!wavevm_valid_mmio_exit(run)) {
+                return;
+            }
             wavevm_handle_mmio(cpu);
         }
     }
@@ -294,6 +376,14 @@ static void *wavevm_cpu_thread_fn(void *arg) {
     int ret;
 
     rcu_register_thread();
+    qemu_mutex_lock_iothread();
+    qemu_thread_get_self(cpu->thread);
+    cpu->thread_id = qemu_get_thread_id();
+    cpu->can_do_io = 1;
+    current_cpu = cpu;
+    cpu_thread_signal_created(cpu);
+    qemu_mutex_unlock_iothread();
+
     cpu->halted = 0;
     
     if (kvm_enabled()) {
@@ -330,27 +420,27 @@ static void *wavevm_cpu_thread_fn(void *arg) {
                         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
                         goto out;
                     case KVM_EXIT_HLT:
+                        qemu_mutex_lock_iothread();
                         qemu_wait_io_event(cpu);
+                        qemu_mutex_unlock_iothread();
                         break;
                     default: break;
                 }
             } else {
                 qemu_mutex_lock_iothread();
-                qemu_tcg_cpu_exec(cpu);
+                cpu_exec(cpu);
                 qemu_mutex_unlock_iothread();
             }
         } else {
+            qemu_mutex_lock_iothread();
             qemu_wait_io_event(cpu);
+            qemu_mutex_unlock_iothread();
         }
     }
 out:
     rcu_unregister_thread();
     return NULL;
 }
-
-// 替换 QEMU 默认的 vCPU 线程启动逻辑
-// 导出 connect_to_master_helper 以便调用
-extern int connect_to_master_helper(void);
 
 /* 
  * [物理意图] 为每个逻辑核心开辟专属的“高速公路（Per-vCPU Socket Pool）”。
@@ -369,8 +459,8 @@ void wavevm_start_vcpu_thread(CPUState *cpu) {
         pthread_mutex_lock(&g_init_lock);
         // 再次检查，防止在等待锁的过程中已被其他线程初始化
         if (!g_vcpu_socks) {
-            MachineState *ms = MACHINE(qdev_get_machine());
-            g_configured_vcpus = ms->smp.cpus; 
+            g_configured_vcpus = (current_machine && current_machine->smp.cpus > 0) ?
+                                 current_machine->smp.cpus : 1;
             
             g_vcpu_socks = g_malloc0(sizeof(int) * g_configured_vcpus);
             for (int i = 0; i < g_configured_vcpus; i++) {

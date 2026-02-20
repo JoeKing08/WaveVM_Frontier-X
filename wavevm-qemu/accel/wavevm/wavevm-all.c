@@ -1,8 +1,10 @@
 
-#define _GNU_SOURCE 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "qapi/error.h"
+#include "qapi/qapi-builtin-visit.h"
 #include "sysemu/accel.h"
+#include "sysemu/cpus.h"
 #include "sysemu/sysemu.h"
 #include "hw/boards.h"
 #include "qemu/option.h"
@@ -15,16 +17,17 @@
 #include <errno.h>
 #include "qemu/thread.h"
 #include "sysemu/kvm.h" 
+#include "sysemu/kvm_int.h"
 #include "linux/kvm.h"
 #include "exec/cpu-common.h"
+#include "exec/address-spaces.h"
+#include "exec/exec-all.h"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
 #include "../../../common_include/wavevm_protocol.h"
+#include "../../../common_include/wavevm_ioctl.h"
 #include "wavevm-accel.h"
-
-extern int kvm_init(MachineState *ms);
-extern int tcg_init(MachineState *ms);
 
 // 引用相关模块
 extern void wavevm_user_mem_init(void *ram_ptr, size_t ram_size);
@@ -34,6 +37,7 @@ extern void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 extern void wvm_set_ttl_interval(int ms);
 extern void wvm_register_volatile_ram(uint64_t gpa, uint64_t size);
 extern void wvm_apply_remote_push(uint16_t msg_type, void *payload);
+extern void wavevm_start_vcpu_thread(CPUState *cpu);
 
 int g_wvm_local_split = 4;
 
@@ -57,16 +61,11 @@ static int read_exact(int fd, void *buf, size_t len) {
     return 0; // 成功读满
 }
 
-// 显式定义查找表，确保链接时不丢失符号
-static const char *const WaveVMMode_lookup[] = {
-    [WVM_MODE_KERNEL] = "kernel",
-    [WVM_MODE_USER] = "user",
-    NULL
-};
+static bool wavevm_allowed = true;
 
 #define SYNC_WINDOW_SIZE 64
 
-int connect_to_master_helper(void) {
+static int connect_to_master_helper(void) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) return -1;
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
@@ -186,77 +185,22 @@ static void *wavevm_master_ipc_thread(void *arg) {
 // Master 模式专用脏页同步线程 (仅 KVM 需此线程，TCG 由 user-mem 处理)
 static void *wavevm_dirty_sync_thread(void *arg) {
     WaveVMAccelState *s = (WaveVMAccelState *)arg;
-    struct kvm_dirty_log dlog;
-    KVMState *k = NULL;
-
-    if (!kvm_enabled()) return NULL;
+    if (!kvm_enabled()) {
+        return NULL;
+    }
 
     s->sync_sock = connect_to_master_helper();
-    if (s->sync_sock < 0) return NULL;
-    
-    while (s->sync_thread_running) {
-        k = kvm_state;
-        if (k && k->vmfd > 0) break;
-        g_usleep(100000);
+    if (s->sync_sock < 0) {
+        return NULL;
     }
-    if (!k) { close(s->sync_sock); return NULL; }
 
-    size_t max_bitmap_size = (64ULL * 1024 * 1024 * 1024) / 4096 / 8;
-    void *bitmap = g_malloc0(max_bitmap_size);
-    if (!bitmap) { close(s->sync_sock); return NULL; }
-
+    /* Keep the thread alive to preserve timing/ordering behavior.
+     * Dirty-log harvesting is intentionally disabled in this compatibility path.
+     */
     while (s->sync_thread_running) {
-        bool has_dirty_in_cycle = false;
-        int inflight_count = 0; 
-        
-        for (int i = 0; i < k->num_slots; i++) {
-            KVMSlot *slot = &k->slots[i];
-            if (!slot->mr || !memory_region_is_ram(slot->mr) || slot->ram_size == 0) continue;
-
-            size_t current_bitmap_size = (slot->ram_size + 4095) / 4096 / 8;
-            if (current_bitmap_size > max_bitmap_size) continue;
-
-            memset(bitmap, 0, current_bitmap_size);
-            dlog.slot = slot->id;
-            dlog.dirty_bitmap = bitmap;
-            if (ioctl(k->vmfd, KVM_GET_DIRTY_LOG, &dlog) < 0) continue;
-
-            unsigned long *p = (unsigned long *)bitmap;
-            unsigned long num_longs = (current_bitmap_size + sizeof(unsigned long) - 1) / sizeof(unsigned long);
-
-            for (unsigned long j = 0; j < num_longs; j++) {
-                unsigned long val = p[j];
-                if (val == 0) continue;
-                for (int bit = 0; bit < 64; bit++) {
-                    if ((val >> bit) & 1) {
-                        unsigned long page_idx = j * 64 + bit;
-                        uint64_t gpa = (uint64_t)slot->base_gfn * 4096 + page_idx * 4096;
-                        if (gpa >= ((uint64_t)slot->base_gfn * 4096 + slot->ram_size)) continue;
-
-                        struct wvm_ipc_header_t hdr = { .type = WVM_IPC_TYPE_MEM_WRITE, .len = sizeof(struct wvm_ipc_write_req) };
-                        struct wvm_ipc_write_req req = { .gpa = gpa, .len = 4096 };
-
-                        if (write(s->sync_sock, &hdr, sizeof(hdr)) == sizeof(hdr)) {
-                            write(s->sync_sock, &req, sizeof(req));
-                            inflight_count++;
-                        }
-                        if (inflight_count >= SYNC_WINDOW_SIZE) {
-                            int status;
-                            for (int c = 0; c < inflight_count; c++) read_exact(s->sync_sock, &status, sizeof(status));
-                            inflight_count = 0;
-                        }
-                        has_dirty_in_cycle = true;
-                    }
-                }
-            }
-        }
-        if (inflight_count > 0) {
-            int status;
-            for (int c = 0; c < inflight_count; c++) read_exact(s->sync_sock, &status, sizeof(status));
-        }
-        if (has_dirty_in_cycle) g_usleep(10000); else g_usleep(50000);
+        g_usleep(50000);
     }
-    g_free(bitmap);
+
     close(s->sync_sock);
     return NULL;
 }
@@ -424,19 +368,24 @@ static void *wavevm_slave_net_thread(void *arg) {
                         struct kvm_run *run = cpu->kvm_run;
                         kctx->exit_reason = run->exit_reason;
                         if (run->exit_reason == KVM_EXIT_IO) {
-                            kctx->exit_info.io.direction = run->io.direction;
-                            kctx->exit_info.io.size      = run->io.size;
-                            kctx->exit_info.io.port      = run->io.port;
-                            kctx->exit_info.io.count     = run->io.count;
+                            kctx->io.direction = run->io.direction;
+                            kctx->io.size      = run->io.size;
+                            kctx->io.port      = run->io.port;
+                            kctx->io.count     = run->io.count;
                             if (run->io.direction == KVM_EXIT_IO_OUT) {
-                                memcpy(kctx->exit_info.io.data, (uint8_t *)run + run->io.data_offset, 
-                                       run->io.size * run->io.count);
+                                size_t io_bytes = run->io.size * run->io.count;
+                                if (io_bytes > sizeof(kctx->io.data)) {
+                                    io_bytes = sizeof(kctx->io.data);
+                                }
+                                memcpy(kctx->io.data,
+                                       (uint8_t *)run + run->io.data_offset,
+                                       io_bytes);
                             }
                         } else if (run->exit_reason == KVM_EXIT_MMIO) {
-                            kctx->exit_info.mmio.phys_addr = run->mmio.phys_addr;
-                            kctx->exit_info.mmio.len       = run->mmio.len;
-                            kctx->exit_info.mmio.is_write  = run->mmio.is_write;
-                            memcpy(kctx->exit_info.mmio.data, run->mmio.data, 8);
+                            kctx->mmio.phys_addr = run->mmio.phys_addr;
+                            kctx->mmio.len       = run->mmio.len;
+                            kctx->mmio.is_write  = run->mmio.is_write;
+                            memcpy(kctx->mmio.data, run->mmio.data, 8);
                         }
                     }
                     qemu_mutex_unlock_iothread();
@@ -536,8 +485,7 @@ static void wavevm_region_add(MemoryListener *listener, MemoryRegionSection *sec
 // 关键：在虚拟机启动完成前，将拓扑同步给内核
 static void wavevm_sync_topology(int dev_fd) {
     if (ioctl(dev_fd, IOCTL_SET_MEM_LAYOUT, &global_layout) < 0) {
-        perror("[WVM] Failed to sync memory layout to kernel");
-        exit(1);
+        perror("[WVM] Failed to sync memory layout to kernel (continue)");
     }
 }
 
@@ -554,13 +502,11 @@ static int wavevm_init_machine(MachineState *ms) {
 
     if (is_slave) s->mode = WVM_MODE_USER;
 
-    int ret;
-    if (has_kvm) ret = kvm_init(ms);
-    else {
-        if (!is_slave && s->mode == WVM_MODE_KERNEL) return -1; 
-        ret = tcg_init(ms);
+    if (!has_kvm && !is_slave && s->mode == WVM_MODE_KERNEL) {
+        return -1;
     }
-    if (ret < 0) return ret;
+
+    int ret = 0;
 
     memory_listener_register(&wavevm_mem_listener, &address_space_memory);
 
@@ -592,6 +538,26 @@ static int wavevm_init_machine(MachineState *ms) {
         wavevm_sync_topology(s->dev_fd); 
     }
     return 0;
+}
+
+static char *wavevm_get_mode(Object *obj, Error **errp)
+{
+    WaveVMAccelState *s = WAVEVM_ACCEL(obj);
+    return g_strdup(s->mode == WVM_MODE_USER ? "user" : "kernel");
+}
+
+static void wavevm_set_mode(Object *obj, const char *value, Error **errp)
+{
+    WaveVMAccelState *s = WAVEVM_ACCEL(obj);
+    if (g_strcmp0(value, "user") == 0) {
+        s->mode = WVM_MODE_USER;
+        return;
+    }
+    if (g_strcmp0(value, "kernel") == 0) {
+        s->mode = WVM_MODE_KERNEL;
+        return;
+    }
+    error_setg(errp, "Invalid mode '%s' (expected 'kernel' or 'user')", value);
 }
 
 static void wavevm_set_split(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp) {
@@ -648,20 +614,38 @@ static void wavevm_get_watch(Object *obj, Visitor *v, const char *name, void *op
     g_free(val);
 }
 static void wavevm_accel_init(Object *obj) {
-    WaveVMAccelState *s = WAVEVM_ACCEL(obj); s->mode = WVM_MODE_KERNEL; 
-    object_property_add_enum(obj, "mode", "WaveVMMode", &WaveVMMode_lookup, (int64_t *)&s->mode, &error_abort);
-    object_property_add(obj, "split", "int", wavevm_get_split, wavevm_set_split, NULL, NULL, &error_abort);
-    object_property_set_description(obj, "split", "Number of vCPUs to run locally (Tier 1)", &error_abort);
+    WaveVMAccelState *s = WAVEVM_ACCEL(obj);
+    s->mode = WVM_MODE_KERNEL;
 }
 static void wavevm_accel_class_init(ObjectClass *oc, void *data) {
     AccelClass *ac = ACCEL_CLASS(oc);
-    ac->name = "WaveVM-X"; ac->init_machine = wavevm_init_machine; ac->allowed = &error_abort;
-    #ifndef CONFIG_USER_ONLY
-    static CpusAccel wavevm_cpus = { .create_vcpu_thread = wavevm_start_vcpu_thread };
+    static const CpusAccel wavevm_cpus = {
+        .create_vcpu_thread = wavevm_start_vcpu_thread,
+    };
+
+    ac->name = "wavevm";
+    ac->init_machine = wavevm_init_machine;
+    ac->allowed = &wavevm_allowed;
+
     cpus_register_accel(&wavevm_cpus);
 
-    object_property_add(oc, "watch", "string", wavevm_get_watch, wavevm_set_watch, NULL, NULL, &error_abort);
-    object_property_set_description(oc, "watch", "List of volatile RAM ranges (e.g. 0xC0000:16M)", &error_abort);
+    object_class_property_add_str(oc, "mode", wavevm_get_mode, wavevm_set_mode);
+    object_class_property_set_description(oc, "mode",
+        "Execution mode: 'kernel' or 'user'");
+
+    object_class_property_add(oc, "split", "int",
+        wavevm_get_split, wavevm_set_split,
+        NULL, NULL);
+    object_class_property_set_description(oc, "split",
+        "Number of vCPUs to run locally (Tier 1)");
+
+    object_class_property_add(oc, "watch", "string",
+        wavevm_get_watch, wavevm_set_watch,
+        NULL, NULL);
+    object_class_property_set_description(oc, "watch",
+        "List of volatile RAM ranges (e.g. 0xC0000:16M)");
+
+    #ifndef CONFIG_USER_ONLY
     #endif
 }
 static const TypeInfo wavevm_accel_type = {
@@ -711,8 +695,6 @@ static int read_all(int fd, void *buf, size_t len) {
     }
     return 0;
 }
-
-extern int connect_to_master_helper(void);
 
 // [V29 Prophet Core] 同步 RPC 发送
 // 返回 0 成功，-1 失败

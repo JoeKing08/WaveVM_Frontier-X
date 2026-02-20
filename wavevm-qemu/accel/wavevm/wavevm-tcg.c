@@ -1,6 +1,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "exec/exec-all.h"
 #include "../../../common_include/wavevm_protocol.h"
 
 // Export QEMU TCG state to network packet
@@ -72,4 +73,3 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->idt.base = ctx->idt_base;
     env->idt.limit = ctx->idt_limit;
 }
-

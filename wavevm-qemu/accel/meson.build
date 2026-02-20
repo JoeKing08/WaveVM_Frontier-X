@@ -3,6 +3,7 @@ softmmu_ss.add(files('accel.c'))
 subdir('qtest')
 subdir('kvm')
 subdir('tcg')
+subdir('wavevm')
 subdir('xen')
 subdir('stubs')
 

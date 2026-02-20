@@ -13,7 +13,6 @@
  * - 严禁关闭 Lazy TLB Flush (defer_ro_protect)，否则 QEMU 性能将崩溃。
  * ---------------------------------------------------------------------------
  */
-#define _GNU_SOURCE
 #include "qemu/osdep.h"
 #include <sys/mman.h>
 #include <signal.h>
@@ -41,12 +40,21 @@ static int g_is_slave = 0;
 static int g_fd_req = -1;  
 static __thread int t_req_sock = -1;
 static __thread uint8_t t_net_buf[WVM_MAX_PACKET_SIZE];
-// 引用外部计算函数 (确保已链接 crc32.o)
-extern uint32_t calculate_crc32(const void* data, size_t length);
 static int g_fd_push = -1; 
 static void *g_ram_base = NULL;
 static size_t g_ram_size = 0;
 static uint32_t g_slave_id = 0;
+static bool g_fault_hook_enabled = false;
+static bool g_fault_hook_checked = false;
+static int g_client_sync_batch = 1024; // 当前生效的 Batch
+static int g_min_batch = 1;            // 下限
+static int g_max_batch = 8192;         // 上限
+static int g_enable_auto_tuning = 1;   // 开关：1=自动, 0=固定(强一致用)
+
+static uint64_t get_us_time(void);
+static uint64_t get_local_page_version(uint64_t gpa);
+static void set_local_page_version(uint64_t gpa, uint64_t version);
+static long wait_for_directory_ack_safe(void);
 
 // 脏区捕获链表
 typedef struct WritablePage {
@@ -82,8 +90,15 @@ static int g_block_count = 0;
  * [后果] 若未正确注册，特定的内存区域将脱离分布式一致性引擎的监控，导致该区域的写操作无法全网同步。
  */
 void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa) {
+    if (!g_fault_hook_checked) {
+        const char *hook_env = getenv("WVM_ENABLE_FAULT_HOOK");
+        g_fault_hook_enabled = (hook_env && atoi(hook_env) != 0);
+        g_fault_hook_checked = true;
+    }
     if (g_block_count >= MAX_RAM_BLOCKS) exit(1);
-    mprotect(hva, size, PROT_NONE);
+    if (g_fault_hook_enabled) {
+        mprotect(hva, size, PROT_NONE);
+    }
     g_mem_blocks[g_block_count].hva_start = (uintptr_t)hva;
     g_mem_blocks[g_block_count].hva_end   = (uintptr_t)hva + size;
     g_mem_blocks[g_block_count].gpa_start = gpa;
@@ -282,7 +297,9 @@ void wvm_apply_remote_push(uint16_t msg_type, void *payload) {
         else {
             // 此时内存状态已不可信，必须强制失效
             // 下次访问触发 sigsegv -> request_page_sync (V28 Pull) 拉取最新全量
-            mprotect((uint8_t*)g_ram_base + gpa, 4096, PROT_NONE);
+            if (g_fault_hook_enabled) {
+                mprotect((uint8_t*)g_ram_base + gpa, 4096, PROT_NONE);
+            }
             
             // 将本地版本置 0，确保下次 Pull 回来的数据（无论版本多少）都能成功覆盖
             set_local_page_version(gpa, 0); 
@@ -326,7 +343,6 @@ static bool check_and_apply_next(uint64_t gpa, uint64_t next_ver) {
     uint32_t cur_epoch = (uint32_t)(local_v >> 32);
     uint64_t next_b = ((uint64_t)(cur_epoch + 1) << 32) | 1;
 
-    bool applied = false;
     pthread_spin_lock(&g_reorder_lock);
 
     // 1. 先探测可能性 A
@@ -363,13 +379,6 @@ static pthread_mutex_t g_writable_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // 线程局部
 static __thread int t_com_sock = -1; 
-static __thread uint8_t t_net_buf[WVM_MAX_PACKET_SIZE]; 
-
-// --- 扩展 IPC 结构 (本地定义以匹配 Daemon 扩展) ---
-struct wvm_ipc_fault_ack {
-    int status;
-    uint64_t version; // [V29] 必须同步版本号
-};
 
 // --- 辅助函数 ---
 
@@ -655,8 +664,6 @@ static inline void wait_on_latch(uint64_t gpa) {
 // [REVISED] 信号处理：加入 Latch 检查
 // ---------------------------------------------------------------------------
 
-#define LATCH_IDX(gpa) ((gpa >> 12) % LATCH_SHARDS)
-
 /* 
  * [物理意图] 模拟处理器的“缺页异常处理单元”，实现按需拉取与乐观写入。
  * [关键逻辑] 1. 读缺页：回退到 V28 阻塞拉取；2. 写保护：利用预分配池进行 Copy-Before-Write (CBW) 捕获。
@@ -857,8 +864,7 @@ static void *diff_harvester_thread_fn(void *arg) {
             void *page_addr = (uint8_t*)g_ram_base + curr->gpa;
             if (!page_addr) { 
                 // 错误处理：释放资源并跳过
-                free(curr->pre_image_snapshot);
-                WritablePage *nxt = curr->next; free(curr); curr = nxt;
+                WritablePage *nxt = curr->next; curr = nxt;
                 continue; 
             }
             int idx = LATCH_IDX(curr->gpa);
@@ -931,10 +937,8 @@ static void *diff_harvester_thread_fn(void *arg) {
                 }
             }
 
-            // 清理资源
-            free(curr->pre_image_snapshot);
+            // 清理资源：节点与快照都来自预分配池，不在这里 free
             WritablePage *next_node = curr->next;
-            free(curr); 
             curr = next_node;
         }
         flush_aggregator();
@@ -967,12 +971,6 @@ static void sb_compact(StreamBuffer *sb) {
         sb->head = 0;
     }
 }
-
-// --- [V29 Sync Engine Config] ---
-static int g_client_sync_batch = 1024; // 当前生效的 Batch
-static int g_min_batch = 1;            // 下限
-static int g_max_batch = 8192;         // 上限
-static int g_enable_auto_tuning = 1;   // 开关：1=自动, 0=固定(强一致用)
 
 // --- [V29 Sync Concurrency Control] ---
 static pthread_mutex_t g_sync_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1083,7 +1081,9 @@ static void *mem_push_listener_thread(void *arg) {
                     
                     // 触发强制同步
                     void* hva = gpa_to_hva_safe(stale_gpa);
-                    if (hva) mprotect(hva, 4096, PROT_NONE);
+                    if (hva && g_fault_hook_enabled) {
+                        mprotect(hva, 4096, PROT_NONE);
+                    }
                     set_local_page_version(stale_gpa, 0);
                 }
             }
@@ -1133,7 +1133,6 @@ static void *mem_push_listener_thread(void *arg) {
                         wvm_apply_remote_push(msg_type, payload);
                         
                         // 链式反应：检查重排缓冲区是否有 v+2, v+3...
-                        uint64_t next = push_ver + 1;
                         // 只要能应用成功，就继续。参数虽然传了，但函数内部现在会动态寻找真正的“下一跳”。
                         while (check_and_apply_next(gpa, 0)) ;
                         
@@ -1145,7 +1144,9 @@ static void *mem_push_listener_thread(void *arg) {
                         } else {
                             // 严重乱序：回退到 Pull 模式
                             // 这种情况下必须立即锁回，不能 Lazy，因为状态已重置
-                            mprotect((uint8_t*)g_ram_base + gpa, 4096, PROT_NONE);
+                            if (g_fault_hook_enabled) {
+                                mprotect((uint8_t*)g_ram_base + gpa, 4096, PROT_NONE);
+                            }
                             set_local_page_version(gpa, 0);
                         }
                     }
@@ -1188,6 +1189,13 @@ static void *mem_push_listener_thread(void *arg) {
 void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
     g_ram_base = ram_ptr;
     g_ram_size = ram_size;
+    bool enable_fault_hook = false;
+    const char *hook_env = getenv("WVM_ENABLE_FAULT_HOOK");
+    if (hook_env && atoi(hook_env) != 0) {
+        enable_fault_hook = true;
+    }
+    g_fault_hook_enabled = enable_fault_hook;
+    g_fault_hook_checked = true;
 
     init_latches();
     pthread_spin_init(&g_reorder_lock, 0); 
@@ -1215,14 +1223,15 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
         pthread_create(&g_harvester_thread, NULL, diff_harvester_thread_fn, NULL);
     }
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER; 
-    sa.sa_sigaction = sigsegv_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
+    if (enable_fault_hook) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER; 
+        sa.sa_sigaction = sigsegv_handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
 
-    // Initial state: Invalid (PROT_NONE)
-    mprotect(g_ram_base, g_ram_size, PROT_NONE);
+        // Initial state: Invalid (PROT_NONE)
+        mprotect(g_ram_base, g_ram_size, PROT_NONE);
+    }
 }
-

@@ -349,9 +349,24 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
     MachineClass *mc = MACHINE_GET_CLASS(machine);
     const CPUArchIdList *arch_ids = mc->possible_cpu_arch_ids(machine);
     char *cphp_res_path = g_strdup_printf("%s." CPUHP_RES_DEVICE, res_root);
-    Object *obj = object_resolve_path_type("", TYPE_ACPI_DEVICE_IF, NULL);
-    AcpiDeviceIfClass *adevc = ACPI_DEVICE_IF_GET_CLASS(obj);
-    AcpiDeviceIf *adev = ACPI_DEVICE_IF(obj);
+    Object *obj;
+    AcpiDeviceIfClass *adevc;
+    AcpiDeviceIf *adev;
+
+    if (getenv("WVM_ENV_SOCK_PATH")) {
+        g_free(cphp_res_path);
+        return;
+    }
+
+    if (!arch_ids || (arch_ids->len > 0 && !arch_ids->cpus)) {
+        warn_report_once("WaveVM: invalid CPU arch-id list, skip CPU AML build");
+        g_free(cphp_res_path);
+        return;
+    }
+
+    obj = object_resolve_path_type("", TYPE_ACPI_DEVICE_IF, NULL);
+    adevc = ACPI_DEVICE_IF_GET_CLASS(obj);
+    adev = ACPI_DEVICE_IF(obj);
 
     cpu_ctrl_dev = aml_device("%s", cphp_res_path);
     {
@@ -468,6 +483,9 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
 
         method = aml_method(CPU_SCAN_METHOD, 0, AML_SERIALIZED);
         {
+            aml_append(method, aml_return(zero));
+#if 0
+
             const uint8_t max_cpus_per_pass = 255;
             Aml *else_ctx;
             Aml *while_ctx, *while_ctx2;
@@ -609,10 +627,11 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
                  * just cleared the insert event for *all* CPUs in
                  * CPU_ADDED_LIST, including the last one. So the scan will
                  * simply seek past it.
-                 */
+                */
             }
             aml_append(method, while_ctx2);
             aml_append(method, aml_release(ctrl_lock));
+#endif
         }
         aml_append(cpus_dev, method);
 

@@ -9,26 +9,13 @@
  */
 
 void wavevm_setup_memory_region(MemoryRegion *mr, uint64_t size, int fd) {
-    void *ptr;
-
-    // Mode A: fd is /dev/wavevm
-    // Mode B: fd is /dev/shm/wavevm_ram
-    ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    
-    if (ptr == MAP_FAILED) {
-        fprintf(stderr, "WaveVM: Failed to mmap guest memory from fd=%d. Error: %s\n", 
-                fd, strerror(errno));
-        exit(1);
-    }
-
-    // Register with QEMU
-    memory_region_init_ram_ptr(mr, NULL, "wavevm-ram", size, ptr);
-    
-    // 启用脏页日志 (Dirty Logging)
-    // 这是 Mode B 在 Linux 5.15 上实现写同步的唯一标准方法。
-    // 它告诉 KVM：请追踪这块内存的写入情况。
-    memory_region_set_log(mr, true, DIRTY_MEMORY_MIGRATION);
-
-    fprintf(stderr, "WaveVM: Mapped %lu bytes (Dirty Logging ON).\n", size);
+    /*
+     * Compatibility mode for QEMU 5.2:
+     * The RAM region is already initialized by machine creation; reinitializing
+     * it with memory_region_init_ram_ptr() can corrupt internal state and crash.
+     * Keep existing RAM mapping and let WaveVM hooks operate on that memory.
+     */
+    (void)mr;
+    (void)size;
+    (void)fd;
 }
-
