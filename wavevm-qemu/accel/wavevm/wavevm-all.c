@@ -42,6 +42,8 @@ extern void wavevm_start_vcpu_thread(CPUState *cpu);
 int g_wvm_local_split = 0;
 static bool g_wvm_split_explicit = false;
 static bool g_wvm_mode_explicit = false;
+static void *g_primary_ram_hva = NULL;
+static uint64_t g_primary_ram_size = 0;
 
 static int wavevm_auto_split_from_vcpus(int vcpus)
 {
@@ -538,8 +540,6 @@ static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
 }
 
 static struct wvm_ioctl_mem_layout global_layout;
-static void *g_primary_ram_hva = NULL;
-static uint64_t g_primary_ram_size = 0;
 
 static void wavevm_region_add(MemoryListener *listener, MemoryRegionSection *section) {
     if (!memory_region_is_ram(section->mr)) return;
