@@ -520,9 +520,8 @@ static void *wavevm_cpu_thread_fn(void *arg) {
                     default: break;
                 }
             } else {
-                qemu_mutex_lock_iothread();
+                // TCG 路径的 cpu_exec 内部会处理 iothread 锁，外层不能重复加锁。
                 cpu_exec(cpu);
-                qemu_mutex_unlock_iothread();
             }
         } else {
             qemu_mutex_lock_iothread();
