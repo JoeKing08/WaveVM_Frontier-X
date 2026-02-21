@@ -525,16 +525,21 @@ static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
             ram_ptr = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
         }
     }
+    if (!ram_ptr && g_primary_ram_hva) {
+        ram_ptr = g_primary_ram_hva;
+    }
     if (!ram_ptr) {
         error_report("WaveVM: failed to resolve guest RAM pointer in user mode init");
         return -ENODEV;
     }
-    wavevm_user_mem_init(ram_ptr, ms->ram_size);
+    wavevm_user_mem_init(ram_ptr, g_primary_ram_size ? g_primary_ram_size : ms->ram_size);
 
     return 0;
 }
 
 static struct wvm_ioctl_mem_layout global_layout;
+static void *g_primary_ram_hva = NULL;
+static uint64_t g_primary_ram_size = 0;
 
 static void wavevm_region_add(MemoryListener *listener, MemoryRegionSection *section) {
     if (!memory_region_is_ram(section->mr)) return;
@@ -554,6 +559,10 @@ static void wavevm_region_add(MemoryListener *listener, MemoryRegionSection *sec
         void *hva = memory_region_get_ram_ptr(section->mr) + section->offset_within_region;
         extern void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa);
         wavevm_register_ram_block(hva, size, start_gpa);
+        if (start_gpa == 0 && !g_primary_ram_hva) {
+            g_primary_ram_hva = hva;
+            g_primary_ram_size = size;
+        }
     }
 }
 
