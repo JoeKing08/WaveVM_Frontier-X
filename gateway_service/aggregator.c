@@ -433,8 +433,8 @@ static void* gateway_worker(void *arg) {
                 learn_route(source_id, &src_addrs[i]);
             }
 
-            // Packets from upstream are always considered downstream.
-            if (src->sin_addr.s_addr == g_upstream_addr.sin_addr.s_addr && src->sin_port == g_upstream_addr.sin_port) {
+            // Classify upstream packets by source IP to tolerate NAT/ephemeral source port changes.
+            if (src->sin_addr.s_addr == g_upstream_addr.sin_addr.s_addr) {
                 uint32_t route_id = source_id; // 兼容旧包：没有目标信息时按旧字段转发
                 if (target_id < WVM_MAX_SLAVES) {
                     route_id = target_id;
